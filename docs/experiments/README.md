@@ -2,8 +2,8 @@
 
 This project tracks experiments two ways, per `CLAUDE.md` §5/§7:
 
-1. **`experiments.csv`** (repo root of `code/business_entity_resolution/`, regenerated
-   every run, gitignored) — every invocation of `run_pipeline.py` appends one row:
+1. **`experiments.csv`** (repo root of `code/`, regenerated every run, gitignored) —
+   every invocation of `run_pipeline.py` appends one row:
    timestamp, git commit hash, config diff, blocking recall, mean candidates per S1,
    validation macro F0.5, precision, recall, F0.5 on singletons vs non-singletons, and
    per-country F0.5. This is the machine-generated, exhaustive log.
@@ -27,6 +27,6 @@ scrolling through the full `experiments.csv`. It does not replace either of the 
   change that doesn't improve validation macro F0.5 gets reverted or put behind a
   config flag (`CLAUDE.md` §7).
 - Error analysis after each model run: the 50 worst false positives and false negatives
-  are dumped to `code/business_entity_resolution/artifacts/errors_*.tsv` (see
-  [`../../code/business_entity_resolution/artifacts`](../../code/business_entity_resolution/artifacts)
+  are dumped to `code/artifacts/errors_*.tsv` (see
+  [`../../code/artifacts`](../../code/artifacts)
   — gitignored, not `experiments/`) and reviewed before inventing new features.

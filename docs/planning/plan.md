@@ -175,21 +175,28 @@ Try in order, keep only what beats CV:
   2026-09-25 — see `CLAUDE.md` §4): lead with a 1-2 page executive summary (see "Open
   conflicts" above), then full methodology, blocking strategy (with recall and
   reduction ratio numbers), model architecture, feature list, experiments table,
-  conclusions. The blank official template, if needed for reference, can be
-  re-extracted from `resources/student_resource.zip` (see `resources/README.md`).
+  conclusions. The blank official template, if needed for reference, is no longer kept
+  in this repo (the organizer bundle was removed during the 2026-09-25 flatten of
+  `code/`) — pull it fresh from S3 or ask the team for a copy.
 - README: exact commands data → blocking → matching → output.
 - Verify: validator PASS; every match ⊂ candidates; `candidate_pairs.tsv` is the set the
   model actually scored; MODELS.md lists licences.
-- **Build the zip with explicit exclusions** — `dataset/`, `artifacts/`, `scratch/`,
-  `docs/`, `resources/`, and `experiments/` must NOT be inside
-  `<team_name>_submission.zip`, and `Documentation_template.md` must be copied to the
-  **zip root** (it no longer lives there in the working repo):
+- **Build the zip with explicit exclusions** — `dataset/`, `code/artifacts/`,
+  `scratch/`, `docs/`, and `experiments/` must NOT be inside
+  `<team_name>_submission.zip`, `Documentation_template.md` must be copied to the
+  **zip root** (it no longer lives there in the working repo), and the working repo's
+  flat `code/` must be renamed to `code/business_entity_resolution/` inside the zip
+  (the official submission structure requires that nested name even though this repo's
+  working copy is flat — see `docs/challenge/problem_statement.md`'s *Final Submission
+  Package* section):
   ```bash
-  mkdir -p /tmp/<team_name>_submission
-  cp -r output code/business_entity_resolution /tmp/<team_name>_submission/
+  mkdir -p /tmp/<team_name>_submission/code/business_entity_resolution
+  cp -r output /tmp/<team_name>_submission/
+  cp -r code/* /tmp/<team_name>_submission/code/business_entity_resolution/
   cp docs/methodology/Documentation_template.md /tmp/<team_name>_submission/Documentation_template.md
   rm -rf /tmp/<team_name>_submission/code/business_entity_resolution/artifacts \
-         /tmp/<team_name>_submission/code/business_entity_resolution/scratch
+         /tmp/<team_name>_submission/code/business_entity_resolution/__pycache__ \
+         /tmp/<team_name>_submission/code/business_entity_resolution/tests/__pycache__
   cd /tmp/<team_name>_submission && zip -r ../<team_name>_submission.zip . && cd -
   ```
   Adjust paths to match your actual tree; the point is confirm nothing outside the

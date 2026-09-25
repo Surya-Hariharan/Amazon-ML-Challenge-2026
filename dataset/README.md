@@ -1,17 +1,21 @@
 # dataset/
 
 This directory holds the organizer-provided train/test data for the Amazon ML Challenge
-2026 Business Entity Resolution task. It is **populated locally from
-`resources/student_resource.zip`** (or downloaded fresh from the team's S3 bucket per
-`CLAUDE.md` §3) and is **gitignored** — never committed, and excluded from the final
-submission zip. This file (`README.md`) is the one exception checked into git, so the
-expected layout is documented even when the data itself is absent from a fresh clone.
+2026 Business Entity Resolution task. It is **populated locally by downloading from the
+team's S3 bucket** (per `CLAUDE.md` §3) and is **gitignored** — never committed, and
+excluded from the final submission zip. This file (`README.md`) is the one exception
+checked into git, so the expected layout is documented even when the data itself is
+absent from a fresh clone.
+
+> The organizer's zip bundle that this dataset was originally extracted from is no
+> longer kept in this repository (it was removed during the 2026-09-25 flatten of
+> `code/`) — regenerate from S3 (Option B below) if you need the data again.
 
 ## Do not modify
 
-Every file here is exactly as provided by the organizers. Nothing in `src/` writes into
-this directory; all pipeline outputs go to `output/` (final results) or `artifacts/`
-(caches, intermediate model/embedding artefacts).
+Every file here is exactly as provided by the organizers. Nothing in `code/src/` writes
+into this directory; all pipeline outputs go to `output/` (final results) or
+`code/artifacts/` (caches, intermediate model/embedding artefacts).
 
 ## Layout
 
@@ -73,12 +77,7 @@ to catch drift rather than trusting these numbers blindly.
 ## Regenerating this directory
 
 ```bash
-# Option A: from the organizer bundle already in this repo
-unzip resources/student_resource.zip -d /tmp/student_resource_extract
-# then copy its dataset/train and dataset/test here (path inside the zip may differ —
-# check with `unzip -l resources/student_resource.zip` first)
-
-# Option B: from the team's S3 bucket (see CLAUDE.md §3)
+# From the team's S3 bucket (see CLAUDE.md §3)
 aws s3 ls s3://tensortrio/ --recursive --region ap-south-1
 aws s3 cp s3://tensortrio/<path-to-zip> ./dataset.zip --region ap-south-1
 unzip dataset.zip -d dataset/

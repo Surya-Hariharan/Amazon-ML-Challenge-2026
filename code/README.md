@@ -3,8 +3,8 @@
 For every Source 1 business record, find the Source 2/3 records that describe the same
 real-world business. Scored by macro F0.5 per S1 entity, singletons included.
 
-- **[CLAUDE.md](../../CLAUDE.md)** — task, hard rules, repo layout, pipeline design. Read first.
-- **[plan.md](../../docs/planning/plan.md)** — checkpoint plan and current status.
+- **[CLAUDE.md](../CLAUDE.md)** — task, hard rules, repo layout, pipeline design. Read first.
+- **[plan.md](../docs/planning/plan.md)** — checkpoint plan and current status.
 - **[MODELS.md](MODELS.md)** — licence + parameter count of every model used.
 
 ## Quick start on a fresh SageMaker instance
@@ -19,7 +19,7 @@ conda create -y -n ber python=3.12 && conda activate ber
 ```bash
 git clone <repo-url> amazon_hack
 cd amazon_hack
-pip install -r code/business_entity_resolution/requirements.txt
+pip install -r code/requirements.txt
 
 # dataset: one-time per instance, never committed (CLAUDE.md §3)
 aws s3 ls s3://tensortrio/ --recursive --region ap-south-1        # find the zip key
@@ -30,13 +30,13 @@ unzip dataset.zip -d dataset/
 #   export BER_DATA_DIR=$PWD/dataset/student_resource/dataset
 
 # tests (synthetic fixtures only, ~20 s)
-cd code/business_entity_resolution && python -m pytest -q && cd ../..
+cd code && python -m pytest -q && cd ..
 
 # start Claude Code at the repo root (so it reads CLAUDE.md)
 claude
 ```
 
-## Reproduction (run from `code/business_entity_resolution/`)
+## Reproduction (run from `code/`)
 
 ```bash
 # local validation: 80/20 split of train S1s, tau tuned on OOF, macro F0.5 on the 20%

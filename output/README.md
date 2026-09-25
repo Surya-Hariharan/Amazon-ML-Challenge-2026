@@ -1,7 +1,7 @@
 # output/
 
 Holds only the two final submission TSVs produced by
-`code/business_entity_resolution/src/run_pipeline.py --mode test`:
+`code/src/run_pipeline.py --mode test`:
 
 - **`matching_results.tsv`** — final entity matches. The only file scored on the
   leaderboard. Header: `source1_entity_id\tmatched_entity_ids`.

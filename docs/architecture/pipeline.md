@@ -1,11 +1,10 @@
 # Pipeline architecture
 
 > Factual restatement of the pipeline design already documented in `CLAUDE.md` §5/§6
-> (target design) and `code/business_entity_resolution/README.md` (as-built stage
-> table). No new design decisions are introduced here — this file exists purely to give
-> the pipeline a home under `docs/` for readers who start from `docs/` rather than
-> `CLAUDE.md`. Treat `CLAUDE.md` and `code/business_entity_resolution/README.md` as the
-> sources of truth if this ever drifts from them.
+> (target design) and `code/README.md` (as-built stage table). No new design decisions
+> are introduced here — this file exists purely to give the pipeline a home under
+> `docs/` for readers who start from `docs/` rather than `CLAUDE.md`. Treat `CLAUDE.md`
+> and `code/README.md` as the sources of truth if this ever drifts from them.
 
 ## Stage flow
 
@@ -13,7 +12,7 @@
 raw records ─▶ normalise ─▶ block (multi-pass union) ─▶ features ─▶ LightGBM ─▶ decide ─▶ submission
 ```
 
-## Modules (one per stage, all under `code/business_entity_resolution/src/`)
+## Modules (one per stage, all under `code/src/`)
 
 | Stage | Module | What it does |
 | --- | --- | --- |
@@ -39,11 +38,10 @@ generalisation strategy.
 dataset/{train,test}/*.tsv   (input, gitignored, see dataset/README.md)
         │
         ▼
-code/business_entity_resolution/src/*.py   (pipeline code)
+code/src/*.py   (pipeline code)
         │
-        ├─▶ code/business_entity_resolution/artifacts/   (gitignored caches: normalised
-        │      frames, embeddings, candidates, trained model, OOF predictions — keyed
-        │      by input hash)
+        ├─▶ code/artifacts/   (gitignored caches: normalised frames, embeddings,
+        │      candidates, trained model, OOF predictions — keyed by input hash)
         │
         └─▶ output/matching_results.tsv, output/candidate_pairs.tsv   (final deliverable)
 ```

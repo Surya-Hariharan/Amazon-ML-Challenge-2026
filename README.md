@@ -41,7 +41,7 @@ raw records ─▶ normalise ─▶ block (5 passes) ─▶ features ─▶ Ligh
 ```
 README.md, LICENSE, CLAUDE.md, .gitignore, .gitattributes   — root: entry point, licence,
                                                                  AI/agent context, VCS config
-code/business_entity_resolution/
+code/
 ├── src/        normalize, blocking, features, model, decide, evaluate, run_pipeline
 ├── tests/      unit and end-to-end tests on synthetic data
 ├── artifacts/  cached embeddings, trained models, OOF preds — gitignored
@@ -54,11 +54,18 @@ docs/
 ├── architecture/  pipeline.md — factual restatement of the pipeline design
 ├── experiments/   how experiment tracking works
 └── planning/      plan.md — checkpoint plan and current status
-dataset/        train/test TSVs, gitignored, pulled from resources/ or S3 (see dataset/README.md)
+dataset/        train/test TSVs, gitignored, pulled from S3 (see dataset/README.md)
 utils/          validate_submission.py — organizer-provided, do not modify
-resources/      resources/student_resource.zip — the untouched organizer bundle
 experiments/    configs/, reports/ (tracked); logs/, results/ (gitignored)
 ```
+
+> Note: the repo's `code/` directory is **flat** — `src/`, `tests/`, `artifacts/`,
+> `README.md`, `MODELS.md`, and `requirements.txt` live directly under `code/`. The
+> official submission zip still requires an internal `code/business_entity_resolution/`
+> folder (see `docs/challenge/problem_statement.md`'s *Final Submission Package*
+> section) — that folder name is applied only at packaging time, by copying `code/`
+> into the zip under that name. See `CLAUDE.md` §4 and `docs/planning/plan.md` CP12 for
+> the exact packaging commands.
 
 `Documentation_template.md` is copied from `docs/methodology/` to the zip root when
 assembling the final submission archive — see `CLAUDE.md` §4 and `docs/planning/plan.md`
@@ -68,13 +75,13 @@ CP12 for the exact packaging commands.
 
 ```bash
 git clone https://github.com/Vishalspl-0903/tensortrio-.git && cd tensortrio-
-pip install -r code/business_entity_resolution/requirements.txt   # Python >= 3.12
-cd code/business_entity_resolution && python -m pytest -q          # synthetic-data tests
-python -m src.run_pipeline --mode valid                            # needs the dataset
+pip install -r code/requirements.txt   # Python >= 3.12
+cd code && python -m pytest -q          # synthetic-data tests
+python -m src.run_pipeline --mode valid # needs the dataset
 ```
 
 Data setup and every command are in
-[code/business_entity_resolution/README.md](code/business_entity_resolution/README.md).
+[code/README.md](code/README.md).
 
 ## Results
 
