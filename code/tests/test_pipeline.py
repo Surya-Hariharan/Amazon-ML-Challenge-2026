@@ -1,5 +1,8 @@
 """End-to-end tests of src.run_pipeline on synthetic data (no real dataset needed)."""
 
+import gc
+import weakref
+
 import pandas as pd
 import pytest
 
@@ -63,6 +66,73 @@ def test_prepare_normalises_s2_s3_independently_and_matches_combined(isolated):
     finally:
         rp.normalize_frame = real_normalize_frame
     assert calls == [], f"expected full cache hit, but normalize_frame was called: {calls}"
+
+
+def test_prepare_drops_intermediate_s2n_s3n_after_concat(isolated, monkeypatch):
+    """Regression test for the full-scale OOM fix: prepare() releases s2n/s3n (each
+    as large as `others`) as soon as they are concatenated into it, instead of
+    keeping both the pieces and the merged frame alive until the function returns."""
+    s1, s2, s3, _ = make_dataset(n_s1=80, seed=30)
+    live: list[weakref.ReferenceType] = []
+    real_concat = pd.concat
+
+    def tracking_concat(frames, **kwargs):
+        result = real_concat(frames, **kwargs)
+        live.extend(weakref.ref(f) for f in frames)
+        return result
+
+    monkeypatch.setattr(pd, "concat", tracking_concat)
+    prep = rp.prepare(s1, s2, s3, use_embeddings=False, use_cache=True)
+    gc.collect()
+    assert all(r() is None for r in live), "s2n/s3n were not released after concat"
+    assert len(prep["others"]) == len(s2) + len(s3)
+
+
+def test_run_test_frees_raw_train_before_loading_test_split(isolated, monkeypatch):
+    """Regression test for the full-scale OOM fix: run_test() must fully finish
+    training on the train split -- releasing its raw S1/S2/S3 (~12M rows at full
+    dataset scale) -- *before* it even loads the test split, rather than holding
+    both raw datasets in memory for the whole run (the actual full-scale OOM: both
+    were loaded up front and test_run() itself cannot free one mid-call, since
+    Python keeps a reference on the caller's stack for as long as a call is in
+    flight, regardless of any `del` the callee runs -- see test_run's docstring).
+    run_test() avoids that by calling _train_model() and _predict_test() as two
+    separate, sequential top-level calls instead of going through a single
+    test_run() call."""
+    data = isolated / "dataset"
+    s1, s2, s3, truth = make_dataset(n_s1=100, seed=40)
+    write_split(data, "train", s1, s2, s3, truth)
+    t1, t2, t3, _ = make_dataset(n_s1=70, seed=41)
+    write_split(data, "test", t1, t2, t3)
+    monkeypatch.setattr(config, "TRAIN_FILES", {
+        "s1": data / "train/train_source1.tsv", "s2": data / "train/train_source2.tsv",
+        "s3": data / "train/train_source3.tsv",
+        "ground_truth": data / "train/train_ground_truth.tsv"})
+    monkeypatch.setattr(config, "TEST_FILES", {
+        "s1": data / "test/test_source1.tsv", "s2": data / "test/test_source2.tsv",
+        "s3": data / "test/test_source3.tsv"})
+    monkeypatch.setattr(config, "OUTPUT_DIR", isolated / "output")
+
+    live: list[weakref.ReferenceType] = []
+    real_load_train = rp._load_train
+
+    def tracking_load_train(sample):
+        """Load train as usual, but keep weakrefs to its raw S1/S2/S3 frames."""
+        ts1, ts2, ts3, ttruth = real_load_train(sample)
+        live.extend(weakref.ref(x) for x in (ts1, ts2, ts3))
+        return ts1, ts2, ts3, ttruth
+
+    real_load_test = rp._load_test
+
+    def tracking_load_test():
+        """Before loading test, confirm train's raw frames are already collectible."""
+        gc.collect()
+        assert all(r() is None for r in live), "train's raw frames were still alive"
+        return real_load_test()
+
+    monkeypatch.setattr(rp, "_load_train", tracking_load_train)
+    monkeypatch.setattr(rp, "_load_test", tracking_load_test)
+    rp.run_test(use_embeddings=False)
 
 
 def test_split_s1_stratified_and_disjoint():

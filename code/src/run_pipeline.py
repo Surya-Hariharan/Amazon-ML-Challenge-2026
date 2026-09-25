@@ -145,6 +145,12 @@ def prepare(s1: pd.DataFrame, s2: pd.DataFrame, s3: pd.DataFrame,
     s2n = _cached("norm_s2", _frame_key(s2), lambda: normalize_frame(s2), use_cache)
     s3n = _cached("norm_s3", _frame_key(s3), lambda: normalize_frame(s3), use_cache)
     on = pd.concat([s2n, s3n], ignore_index=True)
+    # s2n/s3n are local to this call (not part of the return value) and pd.concat
+    # copies their content into `on` rather than reusing it, so once `on` exists
+    # they are dead weight — drop them now instead of at function exit so their
+    # memory (as large as `on` itself, at full dataset scale) is freed before the
+    # embedding pass below runs.
+    del s2n, s3n
     emb = None
     if use_embeddings:
         _log("embedding records")
@@ -263,13 +269,19 @@ def valid_run(s1: pd.DataFrame, s2: pd.DataFrame, s3: pd.DataFrame,
     return metrics
 
 
-def test_run(train: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict],
-             test: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
-             out_dir: Path = config.OUTPUT_DIR,
-             use_embeddings: bool = config.USE_EMBEDDINGS, encoder: Encoder | None = None,
-             use_cache: bool = True) -> dict:
-    """Train on labelled data, predict the test split and write both output files."""
-    s1, s2, s3, truth = train
+def _train_model(s1: pd.DataFrame, s2: pd.DataFrame, s3: pd.DataFrame,
+                 truth: dict[str, list[str]], use_embeddings: bool = config.USE_EMBEDDINGS,
+                 encoder: Encoder | None = None, use_cache: bool = True) -> tuple[dict, dict]:
+    """Prepare, block, featurise and fit on the training split. Returns ``(fitted, metrics)``.
+
+    Raw ``s1``/``s2``/``s3`` and every intermediate (``prep_tr``, ``cands_tr``,
+    ``feats_tr``) are local to this call and never appear in ``fitted``/``metrics``,
+    so once it returns none of them are reachable any more — unlike a ``del``
+    inside a function, which cannot free an argument the *caller* still holds a
+    reference to for the duration of the call. ``run_test`` relies on exactly this:
+    it calls this function to completion (freeing train's raw ~12M rows) *before*
+    loading the test split, instead of holding both raw datasets at once.
+    """
     prep_tr = prepare(s1, s2, s3, use_embeddings, encoder, use_cache)
     tr_ids = list(prep_tr["s1"][config.ID_COL])
     cands_tr = block(prep_tr, use_cache)
@@ -281,9 +293,17 @@ def test_run(train: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict],
     fitted = fit_and_tune(feats_tr, truth, tr_ids)
     metrics.update(tau=fitted["tau"], singleton_tau=fitted["singleton_tau"],
                    oof_f05=fitted["oof_f05"])
-    del feats_tr, cands_tr, prep_tr
+    return fitted, metrics
 
-    t1, t2, t3 = test
+
+def _predict_test(fitted: dict, t1: pd.DataFrame, t2: pd.DataFrame, t3: pd.DataFrame,
+                  out_dir: Path = config.OUTPUT_DIR,
+                  use_embeddings: bool = config.USE_EMBEDDINGS, encoder: Encoder | None = None,
+                  use_cache: bool = True) -> dict:
+    """Block, featurise and score the test split with an already-fitted model.
+
+    Writes both output files and returns the test-side metrics dict.
+    """
     prep_te = prepare(t1, t2, t3, use_embeddings, encoder, use_cache)
     te_ids = list(prep_te["s1"][config.ID_COL])
     cands_te = block(prep_te, use_cache)
@@ -295,7 +315,7 @@ def test_run(train: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict],
     candidates = candidates_to_lists(scored)  # exactly the set the model scored
     valid_ids = set(t2[config.ID_COL]) | set(t3[config.ID_COL])
     m_path, c_path = write_submission(matches, candidates, te_ids, valid_ids, out_dir)
-    metrics.update(test_n_s1=len(te_ids), test_n_pairs=len(scored),
+    metrics = dict(test_n_s1=len(te_ids), test_n_pairs=len(scored),
                    test_mean_candidates=len(scored) / max(len(te_ids), 1),
                    test_mean_matches=sum(map(len, matches.values())) / max(len(te_ids), 1),
                    test_empty_share=float(np.mean([not v for v in matches.values()])))
@@ -303,6 +323,30 @@ def test_run(train: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict],
         save_model(fitted["model"], config.ARTIFACTS_DIR / "model_final.txt")
         write_tsv(feature_importance(fitted["model"]), config.ARTIFACTS_DIR / "importance_final.tsv")
     _log(f"wrote {m_path} and {c_path}. Now run utils/validate_submission.py; it must PASS.")
+    return metrics
+
+
+def test_run(train: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict],
+             test: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame],
+             out_dir: Path = config.OUTPUT_DIR,
+             use_embeddings: bool = config.USE_EMBEDDINGS, encoder: Encoder | None = None,
+             use_cache: bool = True) -> dict:
+    """Train on labelled data, predict the test split and write both output files.
+
+    A thin wrapper over :func:`_train_model` and :func:`_predict_test`, kept so the
+    whole pipeline stays testable end-to-end on synthetic DataFrames in one call
+    (CLAUDE.md's testability requirement). At full dataset scale, ``run_test``
+    calls the two halves directly as separate calls instead of going through this
+    function, because a single call to this function requires the caller to pass
+    ``train`` and ``test`` together, and Python keeps a reference to both on the
+    caller's stack for this call's *entire* duration regardless of anything this
+    function itself deletes internally — only returning from a call actually frees
+    what only the caller referenced.
+    """
+    s1, s2, s3, truth = train
+    fitted, metrics = _train_model(s1, s2, s3, truth, use_embeddings, encoder, use_cache)
+    t1, t2, t3 = test
+    metrics.update(_predict_test(fitted, t1, t2, t3, out_dir, use_embeddings, encoder, use_cache))
     return metrics
 
 
@@ -357,6 +401,12 @@ def _load_train(sample: float):
     return subsample_train(data["s1"], data["s2"], data["s3"], truth, sample)
 
 
+def _load_test():
+    """Load the test split's three source frames as a tuple, from config paths."""
+    data = load_split("test")
+    return data["s1"], data["s2"], data["s3"]
+
+
 def run_valid(stage: str, sample: float = config.TRAIN_SAMPLE_FRAC, loco: bool = False,
               use_embeddings: bool = config.USE_EMBEDDINGS, use_cache: bool = True) -> dict:
     """Validation mode on the training files."""
@@ -368,11 +418,18 @@ def run_valid(stage: str, sample: float = config.TRAIN_SAMPLE_FRAC, loco: bool =
 
 def run_test(sample: float = config.TRAIN_SAMPLE_FRAC,
              use_embeddings: bool = config.USE_EMBEDDINGS, use_cache: bool = True) -> dict:
-    """Test mode: train on the training files, write output/ for the test files."""
-    train = _load_train(sample)
-    te = load_split("test")
-    metrics = test_run(train, (te["s1"], te["s2"], te["s3"]), config.OUTPUT_DIR,
-                       use_embeddings, use_cache=use_cache)
+    """Test mode: train on the training files, write output/ for the test files.
+
+    Calls ``_train_model`` and ``_predict_test`` directly (bypassing ``test_run``,
+    see its docstring) as two separate, sequential calls: the first fully returns
+    -- releasing train's raw S1/S2/S3 (~12M rows at full dataset scale), since
+    nothing here binds them to a name either -- *before* the test split is even
+    loaded. This is the fix for the OOM this pipeline hit at full scale, where
+    both raw datasets were loaded up front and stayed resident for the whole run.
+    """
+    fitted, metrics = _train_model(*_load_train(sample), use_embeddings, use_cache=use_cache)
+    metrics.update(_predict_test(fitted, *_load_test(), config.OUTPUT_DIR,
+                                 use_embeddings, use_cache=use_cache))
     log_experiment({"sample": sample, **metrics}, "test", "all")
     return metrics
 
