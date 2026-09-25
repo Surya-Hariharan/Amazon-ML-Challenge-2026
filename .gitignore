@@ -4,21 +4,23 @@
 dataset/*
 !dataset/README.md
 
-# artifacts/ content (cached embeddings, trained models, OOF preds, TF-IDF matrices) is
-# ignored; the four subdirectory placeholders are kept so the scaffold survives a clone.
-artifacts/*
-!artifacts/models/
-!artifacts/embeddings/
-!artifacts/indexes/
-!artifacts/cache/
-artifacts/models/*
-artifacts/embeddings/*
-artifacts/indexes/*
-artifacts/cache/*
-!artifacts/models/.gitkeep
-!artifacts/embeddings/.gitkeep
-!artifacts/indexes/.gitkeep
-!artifacts/cache/.gitkeep
+# code/business_entity_resolution/artifacts/ content (cached embeddings, trained models,
+# OOF preds, TF-IDF matrices) is ignored; the four subdirectory placeholders are kept so
+# the scaffold survives a clone. This is where config.ARTIFACTS_DIR actually resolves —
+# not a repo-root artifacts/ (that duplicate scaffold was removed 2026-09-25).
+code/business_entity_resolution/artifacts/*
+!code/business_entity_resolution/artifacts/models/
+!code/business_entity_resolution/artifacts/embeddings/
+!code/business_entity_resolution/artifacts/indexes/
+!code/business_entity_resolution/artifacts/cache/
+code/business_entity_resolution/artifacts/models/*
+code/business_entity_resolution/artifacts/embeddings/*
+code/business_entity_resolution/artifacts/indexes/*
+code/business_entity_resolution/artifacts/cache/*
+!code/business_entity_resolution/artifacts/models/.gitkeep
+!code/business_entity_resolution/artifacts/embeddings/.gitkeep
+!code/business_entity_resolution/artifacts/indexes/.gitkeep
+!code/business_entity_resolution/artifacts/cache/.gitkeep
 
 scratch/
 # The unzipped organizer bundle (holds the ~2.4 GB dataset) if it lands in the repo root
@@ -51,13 +53,19 @@ Thumbs.db
 .idea/
 
 # NOTE: these must stay TRACKED — never add them (or a blanket *.md) here:
-#   CLAUDE.md, plan.md                                     (Claude Code session context)
+#   README.md, LICENSE, CLAUDE.md                          (repo root — CLAUDE.md must
+#                                                            stay at root: Claude Code
+#                                                            only auto-loads it from
+#                                                            there, not from docs/)
+#   docs/planning/plan.md                                   (checkpoint plan; moved from
+#                                                            repo root on 2026-09-25)
 #   code/business_entity_resolution/README.md             (organizer-required)
 #   docs/methodology/Documentation_template.md             (organizer-required; moved
 #                                                            here from repo root on
 #                                                            2026-09-25 — copied back to
 #                                                            the zip root at packaging,
-#                                                            see plan.md CP12)
+#                                                            see docs/planning/plan.md
+#                                                            CP12)
 #   dataset/README.md, utils/README.md, output/README.md,
 #   resources/README.md                                    (documentation, not data —
 #                                                            see the explicit

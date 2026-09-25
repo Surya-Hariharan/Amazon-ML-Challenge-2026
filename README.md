@@ -39,27 +39,30 @@ raw records ─▶ normalise ─▶ block (5 passes) ─▶ features ─▶ Ligh
 ## Repository structure
 
 ```
+README.md, LICENSE, CLAUDE.md, .gitignore, .gitattributes   — root: entry point, licence,
+                                                                 AI/agent context, VCS config
 code/business_entity_resolution/
 ├── src/        normalize, blocking, features, model, decide, evaluate, run_pipeline
 ├── tests/      unit and end-to-end tests on synthetic data
+├── artifacts/  cached embeddings, trained models, OOF preds — gitignored
 ├── README.md   full reproduction instructions
 └── MODELS.md   licence and size of every pretrained model used
 output/         matching_results.tsv and candidate_pairs.tsv (+ README.md)
 docs/
-├── challenge/     organizer problem statement, submission requirements, guidelines
+├── challenge/     official problem statement + guidelines (verbatim from organizer PDFs)
 ├── methodology/   Documentation_template.md (the methodology write-up, filled in at CP12)
 ├── architecture/  pipeline.md — factual restatement of the pipeline design
-└── experiments/   how experiment tracking works
+├── experiments/   how experiment tracking works
+└── planning/      plan.md — checkpoint plan and current status
 dataset/        train/test TSVs, gitignored, pulled from resources/ or S3 (see dataset/README.md)
 utils/          validate_submission.py — organizer-provided, do not modify
 resources/      resources/student_resource.zip — the untouched organizer bundle
 experiments/    configs/, reports/ (tracked); logs/, results/ (gitignored)
-artifacts/      cached embeddings, trained models, OOF preds — gitignored
 ```
 
 `Documentation_template.md` is copied from `docs/methodology/` to the zip root when
-assembling the final submission archive — see `CLAUDE.md` §4 and `plan.md` CP12 for the
-exact packaging commands.
+assembling the final submission archive — see `CLAUDE.md` §4 and `docs/planning/plan.md`
+CP12 for the exact packaging commands.
 
 ## Quick start
 

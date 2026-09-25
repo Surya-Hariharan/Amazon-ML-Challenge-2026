@@ -2,7 +2,26 @@
 
 This file is read by Claude Code at the start of every session. It defines what we are
 building, the rules we must never break, how the code is organised, and how to work.
-Read `plan.md` next — it holds the current checkpoint and what to do now.
+Read `docs/planning/plan.md` next — it holds the current checkpoint and what to do now.
+
+---
+
+## 0. Authoritative Challenge Documentation
+
+- [`docs/challenge/problem_statement.md`](docs/challenge/problem_statement.md) — the
+  official task definition, dataset schema, output format, submission package
+  structure, and evaluation formula.
+- [`docs/challenge/guidelines.md`](docs/challenge/guidelines.md) — the official
+  operational rules: challenge window, submission limits, leaderboard mechanics,
+  top-100 team requirements, accessibility/login restrictions.
+
+Both are verbatim transcriptions of the official organizer PDFs. **Before making any
+implementation decision that depends on a challenge requirement, consult these two
+documents rather than relying on the summary below** — this file (§1–§2) restates the
+requirements for quick reference, but the two `docs/challenge/` files are the source of
+truth and must never be contradicted by project assumptions, this file included. If
+this file and `docs/challenge/` ever disagree, `docs/challenge/` wins and this file
+should be corrected.
 
 ---
 
@@ -56,7 +75,7 @@ Train countries: US, India. **Test adds France (unseen in training).**
    ```
    Must print `PASS`. Never hand the user a file that has not passed.
 7. **Submission budget: 5 per day, 3 days.** Never suggest a submission without a local
-   validation score that justifies it (see `plan.md` submission log).
+   validation score that justifies it (see `docs/planning/plan.md` submission log).
 8. **Every function gets a docstring.** Commented source code is a required artefact.
 
 ---
@@ -120,7 +139,7 @@ note after the tree for how zip assembly maps the working repo onto this layout.
 `output/` and `code/business_entity_resolution/` map 1:1 onto the same paths at repo
 root. `Documentation_template.md` at the **zip root** is copied from this repo's working
 copy at `docs/methodology/Documentation_template.md` — that file no longer lives at the
-repo root; the packaging step (`plan.md` CP12) copies it to the zip root under its
+repo root; the packaging step (`docs/planning/plan.md` CP12) copies it to the zip root under its
 original bare filename. The organizer-provided raw materials (`dataset/`, `utils/`) are
 NOT nested inside a `student_resource/` folder in this repo — they are separate
 top-level directories (`dataset/`, `utils/`) alongside `code/`; only `dataset/` is
@@ -130,8 +149,8 @@ run `validate_submission.py`) is not part of the required zip structure either �
 organizers already have their own copy.
 
 Artefacts that are not code (cached embeddings, trained models, OOF preds) go in
-`artifacts/` and are gitignored. `dataset/` (downloaded from S3 per §3) is also
-gitignored and excluded from the submission zip.
+`code/business_entity_resolution/artifacts/` and are gitignored. `dataset/` (downloaded
+from S3 per §3) is also gitignored and excluded from the submission zip.
 
 ---
 
@@ -219,20 +238,21 @@ that test. Language-agnostic normalisation matters more than model complexity he
 
 ## 7. How to work
 
-- Before starting a task, read the current checkpoint in `plan.md`. After finishing, tick
+- Before starting a task, read the current checkpoint in `docs/planning/plan.md`. After finishing, tick
   it off and write the result numbers there.
 - Small, testable steps. Run the validation pipeline after every meaningful change and
   compare against the last row of `experiments.csv`. A change that doesn't improve
   validation macro F0.5 gets reverted or put behind a config flag.
 - Seed everything (`config.SEED`). Results must be reproducible from a clean checkout.
-- Cache expensive work (embeddings, TF-IDF matrices) keyed by input hash in `artifacts/`.
+- Cache expensive work (embeddings, TF-IDF matrices) keyed by input hash in
+  `code/business_entity_resolution/artifacts/`.
 - Commit after each checkpoint. Tag each leaderboard submission `sub-d{day}-{n}`.
 - Pin every dependency added in `requirements.txt` immediately.
 - If a decision trades precision for recall, state the expected effect on F0.5.
 - Don't write long notebooks. Code lives in `src/`; throwaway analysis goes in
   `scratch/` (gitignored).
 - Error analysis: after each model run, dump the 50 worst false positives and 50 worst
-  false negatives from validation to `artifacts/errors_*.tsv` and look at them before
+  false negatives from validation to `code/business_entity_resolution/artifacts/errors_*.tsv` and look at them before
   inventing new features.
 
 ## 8. Suggested sub-agent split inside Claude Code

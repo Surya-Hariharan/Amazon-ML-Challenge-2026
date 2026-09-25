@@ -41,8 +41,9 @@ dataset/{train,test}/*.tsv   (input, gitignored, see dataset/README.md)
         ▼
 code/business_entity_resolution/src/*.py   (pipeline code)
         │
-        ├─▶ artifacts/   (gitignored caches: normalised frames, embeddings, candidates,
-        │                 trained model, OOF predictions — keyed by input hash)
+        ├─▶ code/business_entity_resolution/artifacts/   (gitignored caches: normalised
+        │      frames, embeddings, candidates, trained model, OOF predictions — keyed
+        │      by input hash)
         │
         └─▶ output/matching_results.tsv, output/candidate_pairs.tsv   (final deliverable)
 ```

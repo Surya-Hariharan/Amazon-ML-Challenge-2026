@@ -1,81 +1,101 @@
-# ML Challenge 2026 — Evaluation, Leaderboard & Fair-Play Guidelines
-
-> Source: verbatim excerpt from the organizer-provided `student_resource/README.md`
-> (preserved in full at `resources/student_resource.zip`). Reproduced here unedited; do
-> not paraphrase away from it. See also [`problem_statement.md`](problem_statement.md)
-> and [`submission_requirements.md`](submission_requirements.md).
-
-### Evaluation Criteria
-
-Submissions are evaluated using **F_β Score (β = 0.5)** — a precision-heavy metric that
-penalizes false merges (matching two different businesses) more than missed matches.
-
-**Formula:**
+# Amazon ML Challenge 2026 — Guidelines and Key Instructions
 
 ```
-F_0.5 = (1.25 × Precision × Recall) / (0.25 × Precision + Recall)
+Source:  6ab56657b4f1a_guidelines_and_key_instructions_amazon_ml_challenge_2026.pdf
+Status:  Authoritative challenge documentation
+Purpose: The official operational rulebook — challenge window, required artefacts,
+         submission limits, leaderboard mechanics, top-100 team requirements,
+         accessibility/login restrictions, and support process. Do not contradict this
+         document with project assumptions; update project docs/plan to match it.
 ```
 
-Computed as a **macro-average**: F_0.5 is calculated per Source 1 entity, then averaged
-across **all** Source 1 entities in the evaluation set.
+This file is a faithful, unabridged transcription of the official PDF. See also
+[`problem_statement.md`](problem_statement.md) for the technical task definition,
+dataset schema, output format, and evaluation formula (from the companion "Amazon ML
+Challenge Problem Statement" document).
 
-Singletons are included in that average. A Source 1 entity with no true matches scores
-1.0 when you correctly predict an empty list, and 0.0 when you predict any match for it.
-Correctly identifying singletons therefore earns credit, and false merges on them are
-penalised.
+We appreciate your participation in the **Amazon ML Challenge 2026**!!
 
-**Why precision-heavy?** In real-world entity resolution, merging two distinct
-businesses (false positive) is more damaging than missing a link (false negative). F_0.5
-weights precision 2× over recall.
+With the upcoming **ML Challenge**, we urge you to review the following key instructions
+and guidelines meticulously. Your attention to detail and adherence to these guidelines
+will greatly contribute to your success in this endeavour.
 
-**Example:**
+**Prep before you start:** Walk through the blog for ML Challenge on best practices and
+live demo.
 
-- Your model predicts S1-00001 matches [S2-00047, S2-00193, S3-00812]
-- Ground truth says S1-00001 matches [S2-00047, S3-00812]
-- Precision = 2/3, Recall = 2/2 = 1.0
-- F_0.5 = (1.25 × 0.667 × 1.0) / (0.25 × 0.667 + 1.0) = **0.714**
+**Note:** Any form of cheating, plagiarism, or unfair practices, such as registering and
+attempting the challenge via multiple IDs, will not be tolerated and will lead to
+instant disqualification of the participant.
 
-### Leaderboard Information
+Kindly read through the following vital instructions and important guidelines for this
+round:
 
-- **Public Leaderboard:** During the challenge, rankings will be based on a subset of
-  the test set to provide real-time feedback on your model's performance.
-- **Private Leaderboard:** After the challenge ends, the private leaderboard will be
-  revealed, which uses the remaining portion of the test set for evaluation.
-- **Final Rankings:** The final decision will be based on the private leaderboard.
+## Key Instructions
 
-You submit predictions for the full test set in both cases; the split is applied during
-scoring.
+- **Challenge Window:** 25th September 2026, 12:00 AM IST to 27th September 2026, 11:59
+  PM IST.
+- All teams will get access to the **problem statement** with the dataset on day 1 and
+  will have time to build and submit solutions till day 3.
+- Teams can **track their performance** through the **leaderboard**, which will reflect
+  team rankings live over the course of this challenge. After the challenge, the final
+  leaderboard will be revealed.
+- Please use the organizers' **Google Form** to ask any queries during the hackathon.
+- The below-mentioned artefacts need to be shared for the best solution submitted by the
+  team:
+  - 1-2-page document explaining the ML approach, ML models used, experiments and
+    conclusion.
+  - Source code used for experiments, training and inference, with proper comments
+    describing the functions.
+- Each team can make a **maximum of 5 submissions per day** for over 3 days of the
+  hackathon, after which the submit button will be disabled.
+- **Maintain the version history** of all your submissions, as shortlisting will be
+  based on the submitted solutions. Participants may also be required to submit the
+  **final source code** at a later stage.
+- There will be **two leaderboards — Private and Public**. Evaluation and shortlisting
+  will be based on performance across both leaderboards.
+- After successful submission of the artefacts, leaderboard score and each team member
+  satisfying the eligibility criteria, the top 100 teams will be announced.
+- The **Top 100 teams** will then be required to submit the following details/documents:
+  - Methodology used
+  - Candidate generation/ Blocking strategy
+  - Model Architecture and feature engineering
+  - Any other relevant information about the approach.
 
-### Academic Integrity and Fair Play
+> **Note on the "1-2-page document" vs. "no page limit" wording:** this Guidelines PDF
+> asks for a "1-2-page document" as a general best-solution artefact, while
+> `problem_statement.md`'s *Submission Requirements* §3 says the methodology document
+> (`Documentation_template.md`) has "no page limit — prioritise clarity and technical
+> depth over brevity." Both statements are transcribed here exactly as the organizers
+> wrote them; this project's working assumption (see `docs/planning/plan.md`'s "Open
+> conflicts" section) is to write the full detailed document but lead it with a 1-2 page
+> executive summary, satisfying either reading, pending organizer clarification via the
+> Google Form.
 
-**⚠️ STRICTLY PROHIBITED: External Data Lookup**
+## Simultaneous Logins and Accessibility
 
-Participants are **STRICTLY NOT ALLOWED** to use external databases, APIs, or services
-to look up business identities or resolve entities. This includes but is not limited to:
+- You can attempt the ML Challenge on a **desktop or laptop only** and not on a mobile
+  device.
+- **Simultaneous logins are not allowed**; i.e. you can only attempt the ML Challenge
+  from one laptop or desktop per participant.
+- In case simultaneous logins are detected, the system may terminate the ML Challenge
+  altogether, and you may only get error messages.
 
-- Using commercial entity resolution APIs or services
-- Looking up business registrations from government databases
-- Using geocoding APIs to normalize addresses
-- Any external data augmentation from internet sources
+## Other Instructions
 
-**Enforcement:**
+- If you face any technical problem, clear your browser's cache or try it on a
+  different browser or in incognito mode.
+- You may also try changing your internet — mobile hotspot, wifi, etc.
+- Please shoot an email to `support@unstop.com` with a screenshot of the page where you
+  are facing a problem and your registered email ID. Please note that they won't be
+  helping you make decisions, and any email asking them to make decisions will not be
+  entertained.
 
-- All submitted approaches, methodologies, and code pipelines will be thoroughly
-  reviewed and verified
-- Any evidence of external data lookup will result in **immediate disqualification**
+All the best!
 
-**Fair Play:** This challenge is designed to test your machine learning and data science
-skills using only the provided training data.
+Regards,
+**Team Amazon ML Challenge 2026**
 
-### Tips for Success
+---
 
-- Invest in a strong blocking/candidate generation strategy — it determines the upper
-  bound of your recall
-- Explore string similarity features (Jaccard, Levenshtein, TF-IDF cosine) for name and
-  address matching
-- Pay attention to country specific address patterns
-- Consider the precision-recall trade-off carefully — F_0.5 rewards precision more than
-  recall
-- Do not neglect singletons — correctly predicting "no match" is worth a full 1.0 on
-  that entity
-- Validate your own output format against the rules above before submitting
+For the technical task definition, dataset schema, output format, and evaluation
+formula, see [`problem_statement.md`](problem_statement.md).
