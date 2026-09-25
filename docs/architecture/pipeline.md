@@ -50,3 +50,29 @@ code/src/*.py   (pipeline code)
 [`../experiments/README.md`](../experiments/README.md)) record run-level metrics
 (blocking recall, mean candidates/S1, validation macro F0.5, precision/recall,
 singleton vs non-singleton F0.5, per-country F0.5) rather than pipeline artefacts.
+
+## Storage: local disk vs. S3 vs. GitHub
+
+Three separate things back this project, and the pipeline never conflates them:
+
+* **GitHub is the source of truth for code** — everything under `code/src/`, docs,
+  configs. Cloning the repo reproduces the pipeline, not the data.
+* **SageMaker local disk (or your laptop's disk) is temporary compute storage.** Each
+  SageMaker notebook instance is a separate machine with its own empty, ephemeral
+  filesystem; `dataset/`, `code/artifacts/` and `output/` all live there and are
+  gitignored. Normal local pipeline execution
+  (`python -m src.run_pipeline --mode valid|test`) reads and writes only this local
+  disk — it never touches S3, never requires AWS credentials, and never makes a
+  network call.
+* **S3 (`s3://tensortrio/...`) is persistent storage** — the only thing shared between
+  a laptop and every SageMaker instance (CLAUDE.md §3). Moving data between local disk
+  and S3 is always an **explicit, opt-in** action, never automatic: `run_pipeline.py`
+  does not import or call anything in `s3_sync.py`.
+
+`code/src/s3_sync.py` is that opt-in sync layer: `download_dataset()`,
+`upload_artifacts()`, `upload_experiments()` and `upload_submissions()`, each
+independently callable. It lazily imports `boto3` only when one of these functions is
+actually called (boto3 is intentionally not a pinned pipeline dependency), and every
+upload is additive by default — it never deletes existing S3 objects unless a caller
+passes `delete_extra=True`. See the module docstring in `code/src/s3_sync.py` for the
+exact S3 key-mapping scheme and `code/tests/test_s3_sync.py` for usage examples.
