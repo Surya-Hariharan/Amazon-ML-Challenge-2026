@@ -4,7 +4,7 @@ For every Source 1 business record, find the Source 2/3 records that describe th
 real-world business. Scored by macro F0.5 per S1 entity, singletons included.
 
 - **[CLAUDE.md](../../CLAUDE.md)** — task, hard rules, repo layout, pipeline design. Read first.
-- **[plan.md](../../plan.md)** — checkpoint plan and current status.
+- **[plan.md](../../docs/planning/plan.md)** — checkpoint plan and current status.
 - **[MODELS.md](MODELS.md)** — licence + parameter count of every model used.
 
 ## Quick start on a fresh SageMaker instance

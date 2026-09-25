@@ -482,7 +482,7 @@ def report_blocking_stats(
     s1_country: Mapping[str, str] | None = None,
     verbose: bool = True,
 ) -> dict[str, float]:
-    """Blocking quality for plan.md CP3: recall, candidates/S1, reduction ratio.
+    """Blocking quality for docs/planning/plan.md CP3: recall, candidates/S1, reduction ratio.
 
     Args:
         cands: output of :func:`generate_candidates`.

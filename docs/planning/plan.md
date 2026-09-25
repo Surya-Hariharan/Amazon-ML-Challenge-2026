@@ -13,8 +13,9 @@ How to use this file (Claude Code and humans):
 
 ## Open conflicts / questions (resolve early, don't guess)
 
-- **Methodology doc length conflict:** the guidelines doc says the shared artefact for
-  the top-100 stage is a "1-2-page document," but the problem statement says
+- **Methodology doc length conflict:** `../docs/challenge/guidelines.md`'s Key
+  Instructions say the shared artefact for the top-100 stage is a "1-2-page document,"
+  but `../docs/challenge/problem_statement.md`'s Submission Requirements §3 says
   `Documentation_template.md` has "no page limit — prioritise clarity and technical
   depth over brevity." **Ask via the Google Form** which applies. Until answered, write
   the full detailed doc but lead it with a 1-2 page executive summary (methodology,
