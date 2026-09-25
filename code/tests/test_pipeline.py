@@ -26,6 +26,45 @@ def isolated(tmp_path, monkeypatch):
     return tmp_path
 
 
+def test_prepare_normalises_s2_s3_independently_and_matches_combined(isolated):
+    """prepare()'s per-source normalisation is equivalent to normalising the
+    concatenated raw frame, and caches S2/S3 separately (not as one "others" blob)."""
+    from src.normalize import normalize_frame
+
+    s1, s2, s3, _ = make_dataset(n_s1=120, seed=11)
+    prep = rp.prepare(s1, s2, s3, use_embeddings=False, use_cache=True)
+    on = prep["others"]
+
+    # Row count is preserved and matches the raw S2+S3 total.
+    assert len(on) == len(s2) + len(s3)
+
+    # Content is identical to the old "concat raw, then normalise" behaviour.
+    expected = normalize_frame(pd.concat([s2, s3], ignore_index=True))
+    pd.testing.assert_frame_equal(on.reset_index(drop=True), expected.reset_index(drop=True))
+
+    # S2 and S3 were cached independently, not as a single combined "others" artifact.
+    arts = isolated / "artifacts"
+    cached = {p.name for p in arts.glob("norm_*.parquet")}
+    assert any(n.startswith("norm_s2_") for n in cached)
+    assert any(n.startswith("norm_s3_") for n in cached)
+    assert not any(n.startswith("norm_others_") for n in cached)
+
+    # A second call hits the S2/S3 caches independently rather than recomputing.
+    calls = []
+    real_normalize_frame = rp.normalize_frame
+
+    def counting_normalize_frame(df):
+        calls.append(len(df))
+        return real_normalize_frame(df)
+
+    rp.normalize_frame = counting_normalize_frame
+    try:
+        rp.prepare(s1, s2, s3, use_embeddings=False, use_cache=True)
+    finally:
+        rp.normalize_frame = real_normalize_frame
+    assert calls == [], f"expected full cache hit, but normalize_frame was called: {calls}"
+
+
 def test_split_s1_stratified_and_disjoint():
     """80/20 split keeps the singleton share and never overlaps."""
     truth = {f"S1-{i}": ([] if i % 10 == 0 else ["S2-x"]) for i in range(200)}
