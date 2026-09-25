@@ -31,12 +31,24 @@ __MACOSX/
 experiments.csv
 # experiments/logs and experiments/results are regenerable and can grow large; keep them
 # ignored (but tracked as empty scaffolding via .gitkeep). experiments/configs and
-# experiments/reports are meant to stay small and human-readable, so they are NOT
-# ignored here — see experiments/README.md.
+# experiments/reports (the .md files themselves) are meant to stay small and
+# human-readable, so they are NOT ignored here — see experiments/README.md. Generated
+# figure images ARE ignored regardless of where they land — see the image-file rule
+# below (covers experiments/reports/figures/ and any other generated plots).
 experiments/logs/*
 !experiments/logs/.gitkeep
 experiments/results/*
 !experiments/results/.gitkeep
+
+# Generated images (plots/figures from experiments) — never committed, regenerable from
+# the experiment scripts. Applies repo-wide, not just experiments/reports/figures/.
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.svg
+*.webp
 
 # Python
 __pycache__/
