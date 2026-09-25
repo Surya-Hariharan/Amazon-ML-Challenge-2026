@@ -10,10 +10,10 @@ from pathlib import Path
 
 # --- Paths -------------------------------------------------------------------------
 
-#: code/business_entity_resolution/
+#: code/
 CODE_DIR = Path(__file__).resolve().parents[1]
 #: Repository root (<team>_submission/).
-REPO_ROOT = CODE_DIR.parents[1]
+REPO_ROOT = CODE_DIR.parents[0]
 
 
 def _default_data_dir() -> Path:
