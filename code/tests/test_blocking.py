@@ -78,7 +78,14 @@ def test_dense_topk_numpy_matches_brute_force(monkeypatch):
 
 
 def test_dense_topk_gpu_path_if_available():
-    """The torch (fp16) path agrees with brute force up to near-ties."""
+    """The torch (FP32) path agrees exactly with brute force -- no FP16 tolerance needed.
+
+    dense_topk's CUDA branch computes the similarity matmul in float32 (never
+    float16, per CLAUDE.md's FP32 retrieval requirement -- see
+    test_dense_topk_cuda_branch_never_requests_float16 for a host-independent
+    regression guard on that). With a real CUDA device this exercises that branch
+    directly; it is skipped where no CUDA device is available.
+    """
     if blocking._torch_device() is None:
         pytest.skip("no CUDA device")
     rng = np.random.default_rng(2)
@@ -87,8 +94,44 @@ def test_dense_topk_gpu_path_if_available():
     qi, xi, _ = dense_topk(q, x, k=5, query_chunk=16, index_chunk=64)
     got = pd.DataFrame({"q": qi, "x": xi}).groupby("q")["x"].apply(set)
     ref = _brute_topk_sets(q, x, 5)
-    overlap = np.mean([len(got[r] & ref[r]) / 5 for r in range(50)])
-    assert overlap >= 0.95
+    for r in range(50):
+        assert got[r] == ref[r]
+
+
+def test_dense_topk_cuda_branch_never_requests_float16(monkeypatch):
+    """dense_topk's torch branch must request float32 tensors, never float16.
+
+    Forces the "device is not None" branch (as CUDA would) by monkeypatching
+    ``_torch_device`` to a CPU torch device -- so this runs identically on a
+    CPU-only CI host, unlike test_dense_topk_gpu_path_if_available, which needs
+    real CUDA hardware to exercise that branch at all. This is a direct
+    regression guard for the production-audit finding that the CUDA branch used
+    to hardcode ``torch.float16`` for the similarity matmul, contradicting the
+    FP32 retrieval requirement.
+    """
+    torch = pytest.importorskip("torch")
+    monkeypatch.setattr(blocking, "_torch_device", lambda: torch.device("cpu"))
+    seen_dtypes = []
+    orig_to = torch.Tensor.to
+
+    def spy_to(self, *args, **kwargs):
+        """Record any dtype requested by a ``.to(...)`` call, then delegate."""
+        dtype = kwargs.get("dtype")
+        for a in args:
+            if isinstance(a, torch.dtype):
+                dtype = a
+        if dtype is not None:
+            seen_dtypes.append(dtype)
+        return orig_to(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", spy_to)
+    rng = np.random.default_rng(3)
+    q = l2(rng.normal(size=(9, 6))).astype(np.float32)
+    x = l2(rng.normal(size=(13, 6))).astype(np.float32)
+    dense_topk(q, x, k=4, query_chunk=3, index_chunk=4)
+    assert seen_dtypes, "expected the torch branch to run and request a dtype"
+    assert torch.float16 not in seen_dtypes
+    assert all(d == torch.float32 for d in seen_dtypes)
 
 
 def test_dense_topk_k_larger_than_index(monkeypatch):
@@ -255,3 +298,40 @@ def test_compute_embeddings_cached(tmp_path, monkeypatch):
     e2 = compute_embeddings(df, enc)
     assert calls == [2]
     assert e1.shape == (3, 256) and np.array_equal(np.asarray(e1), np.asarray(e2))
+
+
+def test_compute_embeddings_round_trips_at_float32(tmp_path, monkeypatch):
+    """Embeddings are stored and reloaded at float32, matching dense_topk's FP32
+    retrieval precision -- never float16 (production-audit fix: a prior version cast
+    to float16 before caching, silently handing FP32-retrieval code lower-precision
+    vectors on every cache hit)."""
+    monkeypatch.setattr(config, "ARTIFACTS_DIR", tmp_path)
+    df = pd.DataFrame({"business_name": ["A Co", "B Inc"],
+                       "business_address": ["1 X Rd", "2 Y St"]})
+    computed = compute_embeddings(df, fake_encoder, cache=True)
+    assert computed.dtype == np.float32
+    cache_files = list(tmp_path.glob("embf32_*.npy"))
+    assert len(cache_files) == 1
+    reloaded = compute_embeddings(df, encoder=None, cache=True)
+    assert reloaded.dtype == np.float32
+    np.testing.assert_array_equal(np.asarray(computed), np.asarray(reloaded))
+
+
+def test_compute_embeddings_ignores_stale_float16_cache_file(tmp_path, monkeypatch):
+    """A leftover float16 cache file from the old ``emb_<hash>.npy`` naming is never
+    matched by the current float32 cache lookup -- the prefixes cannot collide, so a
+    stale FP16 cache can never be silently reused as FP32 embeddings."""
+    monkeypatch.setattr(config, "ARTIFACTS_DIR", tmp_path)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    # Simulate a leftover artifact from the old (pre-fix) float16 cache scheme: same
+    # directory, old "emb_" prefix, wrong dtype and shape, so a false cache hit would
+    # be easy to detect.
+    stale = tmp_path / "emb_deadbeefdeadbeefdead.npy"
+    np.save(stale, np.zeros((1, 1), dtype=np.float16))
+    df = pd.DataFrame({"business_name": ["A Co"], "business_address": ["1 X Rd"]})
+    out = compute_embeddings(df, fake_encoder, cache=True)
+    assert out.dtype == np.float32
+    assert out.shape == (1, 256)
+    # The stale file is untouched and still float16 -- proving it was never read as
+    # this call's cache.
+    assert np.load(stale).dtype == np.float16

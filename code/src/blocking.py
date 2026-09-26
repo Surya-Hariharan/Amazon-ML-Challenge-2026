@@ -137,6 +137,10 @@ def dense_topk(
     scored against every query chunk. Peak memory is about
     ``query_chunk * index_chunk`` scores plus ``n_queries * k`` running results, so it
     scales to millions of rows per side. Rows should be L2-normalised (cosine).
+    The similarity matmul runs in float32 on every device, CPU or CUDA (CLAUDE.md
+    production decision: embedding retrieval must remain FP32 -- a CUDA float16 matmul
+    was measured by ``diagnose.run_fp16_retrieval`` to carry a real true-match-loss
+    risk at full scale and was never approved for production).
     Returns flat ``(query_row, index_row, score)`` arrays.
     """
     nq, nx = len(queries), len(index)
@@ -153,11 +157,11 @@ def dense_topk(
         xblock = np.asarray(index[xs:xs + index_chunk], dtype=np.float32)
         kb = min(k, len(xblock))
         if device is not None:
-            xt = torch.from_numpy(xblock).to(device, dtype=torch.float16)
+            xt = torch.from_numpy(xblock).to(device, dtype=torch.float32)
         for qs in range(0, nq, query_chunk):
             qblock = np.asarray(queries[qs:qs + query_chunk], dtype=np.float32)
             if device is not None:
-                qt = torch.from_numpy(qblock).to(device, dtype=torch.float16)
+                qt = torch.from_numpy(qblock).to(device, dtype=torch.float32)
                 sv, si = torch.topk((qt @ xt.T).float(), kb, dim=1)
                 sv, si = sv.cpu().numpy(), si.cpu().numpy().astype(np.int64)
             else:
@@ -212,6 +216,15 @@ def load_encoder(model_name: str = config.EMBEDDING_MODEL,
     return encode
 
 
+#: Cache filename prefix for the embedding cache. Encodes the on-disk dtype
+#: (float32) directly in the prefix so that a stale cache file written by a prior
+#: version of this function -- the old ``emb_<hash>.npy`` scheme stored float16 -- can
+#: never be silently loaded and mistaken for a float32 cache: the prefixes never
+#: collide, so a directory holding both old ``emb_*.npy`` and new ``embf32_*.npy``
+#: files always recomputes rather than reusing the stale float16 data.
+_EMBEDDING_CACHE_PREFIX = "embf32"
+
+
 def _texts_key(texts: list[str], model_name: str) -> str:
     """Stable cache key for a list of texts and a model."""
     h = hashlib.sha1(model_name.encode())
@@ -222,19 +235,22 @@ def _texts_key(texts: list[str], model_name: str) -> str:
 
 def compute_embeddings(frame: pd.DataFrame, encoder: Encoder | None = None,
                        cache: bool = True) -> np.ndarray:
-    """Return L2-normalised float16 embeddings for every row of ``frame``.
+    """Return L2-normalised float32 embeddings for every row of ``frame``.
 
-    Cached in ``artifacts/emb_<hash>.npy`` keyed by input texts + model (CLAUDE.md §7),
-    so blocking and features share one encoding pass per split.
+    Cached in ``artifacts/embf32_<hash>.npy`` keyed by input texts + model (CLAUDE.md
+    §7), so blocking and features share one encoding pass per split. Stored and
+    reloaded at float32 -- the same precision ``dense_topk`` retrieves at on every
+    device -- never float16, so a cache hit can never silently hand FP32-retrieval
+    code lower-precision vectors than it was validated on.
     """
     texts = embedding_text(frame)
-    path = config.ARTIFACTS_DIR / f"emb_{_texts_key(texts, config.EMBEDDING_MODEL)}.npy"
+    path = config.ARTIFACTS_DIR / f"{_EMBEDDING_CACHE_PREFIX}_{_texts_key(texts, config.EMBEDDING_MODEL)}.npy"
     if cache and path.exists():
         return np.load(path, mmap_mode="r")
     if encoder is None:
         encoder = load_encoder()
     uniq, inverse = np.unique(np.asarray(texts, dtype=object), return_inverse=True)
-    vecs = encoder(list(uniq)).astype(np.float16)[inverse]
+    vecs = encoder(list(uniq)).astype(np.float32)[inverse]
     if cache:
         config.ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
         np.save(path, vecs)

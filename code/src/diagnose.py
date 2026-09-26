@@ -237,14 +237,14 @@ def _stage_embed() -> dict:
 
     def fn():
         rp.prepare_from_files(config.TRAIN_FILES, use_embeddings=True, use_cache=True)
-    artifacts = list((config.ARTIFACTS_DIR).glob("emb_*.npy"))
+    artifacts = list((config.ARTIFACTS_DIR).glob("embf32_*.npy"))
     return diag.run_stage("embed", fn, artifacts, DIAG_DIR)
 
 
 def _stage_block() -> dict:
     """Stage 3: full-scale blocking/dense retrieval (requires stages 1-2's caches)."""
     _warn_if_missing("norm_*.parquet", "block", "normalize")
-    _warn_if_missing("emb_*.npy", "block", "embed")
+    _warn_if_missing("embf32_*.npy", "block", "embed")
 
     def fn():
         prep = rp.prepare_from_files(config.TRAIN_FILES, use_embeddings=True, use_cache=True)
@@ -256,7 +256,7 @@ def _stage_block() -> dict:
 def _stage_features() -> dict:
     """Stage 4: full-scale feature generation (requires stages 1-3's caches)."""
     _warn_if_missing("norm_*.parquet", "features", "normalize")
-    _warn_if_missing("emb_*.npy", "features", "embed")
+    _warn_if_missing("embf32_*.npy", "features", "embed")
     _warn_if_missing("cands_*.parquet", "features", "block")
 
     def fn():
