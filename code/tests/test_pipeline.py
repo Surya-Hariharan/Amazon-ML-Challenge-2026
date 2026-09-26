@@ -90,15 +90,18 @@ def test_prepare_drops_intermediate_s2n_s3n_after_concat(isolated, monkeypatch):
 
 def test_run_test_frees_raw_train_before_loading_test_split(isolated, monkeypatch):
     """Regression test for the full-scale OOM fix: run_test() must fully finish
-    training on the train split -- releasing its raw S1/S2/S3 (~12M rows at full
-    dataset scale) -- *before* it even loads the test split, rather than holding
-    both raw datasets in memory for the whole run (the actual full-scale OOM: both
+    training on the train split -- releasing every raw/normalised training
+    intermediate -- *before* it even loads the test split, rather than holding
+    both splits in memory for the whole run (the actual full-scale OOM: both
     were loaded up front and test_run() itself cannot free one mid-call, since
     Python keeps a reference on the caller's stack for as long as a call is in
     flight, regardless of any `del` the callee runs -- see test_run's docstring).
-    run_test() avoids that by calling _train_model() and _predict_test() as two
-    separate, sequential top-level calls instead of going through a single
-    test_run() call."""
+    run_test() avoids that by calling the training half and _predict_test() as
+    two separate, sequential top-level calls instead of going through a single
+    test_run() call. At the default sample (>= 1.0), the training half is
+    _train_model_from_files(), which loads S1/S2/S3 sequentially from disk
+    rather than through _load_train() -- see the dedicated sequential-loading
+    tests below for that part of the fix."""
     data = isolated / "dataset"
     s1, s2, s3, truth = make_dataset(n_s1=100, seed=40)
     write_split(data, "train", s1, s2, s3, truth)
@@ -114,25 +117,138 @@ def test_run_test_frees_raw_train_before_loading_test_split(isolated, monkeypatc
     monkeypatch.setattr(config, "OUTPUT_DIR", isolated / "output")
 
     live: list[weakref.ReferenceType] = []
-    real_load_train = rp._load_train
+    real_read_tsv = rp.read_tsv
 
-    def tracking_load_train(sample):
-        """Load train as usual, but keep weakrefs to its raw S1/S2/S3 frames."""
-        ts1, ts2, ts3, ttruth = real_load_train(sample)
-        live.extend(weakref.ref(x) for x in (ts1, ts2, ts3))
-        return ts1, ts2, ts3, ttruth
+    def tracking_read_tsv(path):
+        """Read as usual, but keep a weakref to every raw frame loaded from train/."""
+        df = real_read_tsv(path)
+        if "train" in str(path):
+            live.append(weakref.ref(df))
+        return df
 
     real_load_test = rp._load_test
 
     def tracking_load_test():
-        """Before loading test, confirm train's raw frames are already collectible."""
+        """Before loading test, confirm every raw train frame is already collectible."""
         gc.collect()
-        assert all(r() is None for r in live), "train's raw frames were still alive"
+        assert all(r() is None for r in live), "a raw train frame was still alive"
         return real_load_test()
 
-    monkeypatch.setattr(rp, "_load_train", tracking_load_train)
+    monkeypatch.setattr(rp, "read_tsv", tracking_read_tsv)
     monkeypatch.setattr(rp, "_load_test", tracking_load_test)
     rp.run_test(use_embeddings=False)
+
+
+def test_prepare_from_files_never_holds_more_than_one_raw_source_at_once(isolated, monkeypatch):
+    """Regression test for the full-scale OOM fix: prepare_from_files() must load,
+    normalise and release S1, then S2, then S3 strictly one at a time -- never with
+    more than one raw source resident -- instead of prepare()'s contract, which
+    requires the caller to already hold all three raw frames simultaneously
+    before it can even be called."""
+    data = isolated / "dataset"
+    s1, s2, s3, _ = make_dataset(n_s1=90, seed=50)
+    write_split(data, "train", s1, s2, s3)
+    files = {"s1": data / "train/train_source1.tsv", "s2": data / "train/train_source2.tsv",
+            "s3": data / "train/train_source3.tsv"}
+
+    live: dict[str, weakref.ReferenceType] = {}
+    real_read_tsv = rp.read_tsv
+
+    def tracking_read_tsv(path):
+        """Before loading a new raw source, confirm every earlier one is already gone."""
+        gc.collect()
+        assert all(r() is None for r in live.values()), \
+            f"raw source(s) still alive when loading {path}: {list(live)}"
+        df = real_read_tsv(path)
+        live[str(path)] = weakref.ref(df)
+        return df
+
+    monkeypatch.setattr(rp, "read_tsv", tracking_read_tsv)
+    prep = rp.prepare_from_files(files, use_embeddings=False, use_cache=True)
+    assert len(prep["others"]) == len(s2) + len(s3)
+    assert len(prep["s1"]) == len(s1)
+
+
+def test_prepare_from_files_matches_prepare_content(isolated):
+    """prepare_from_files() (sequential, from disk) produces identical normalised
+    content and row order to prepare() (in-memory), for the same underlying data."""
+    data = isolated / "dataset"
+    s1, s2, s3, _ = make_dataset(n_s1=70, seed=51)
+    write_split(data, "train", s1, s2, s3)
+    files = {"s1": data / "train/train_source1.tsv", "s2": data / "train/train_source2.tsv",
+            "s3": data / "train/train_source3.tsv"}
+
+    expected = rp.prepare(s1, s2, s3, use_embeddings=False, use_cache=False)
+    got = rp.prepare_from_files(files, use_embeddings=False, use_cache=False)
+    pd.testing.assert_frame_equal(got["s1"].reset_index(drop=True),
+                                  expected["s1"].reset_index(drop=True))
+    pd.testing.assert_frame_equal(got["others"].reset_index(drop=True),
+                                  expected["others"].reset_index(drop=True))
+
+
+def test_prepare_from_files_reuses_prepare_cache(isolated):
+    """A normalisation cache built by prepare() is reused by prepare_from_files()
+    (and vice versa): they share the same cache keys/paths, keyed on content."""
+    data = isolated / "dataset"
+    s1, s2, s3, _ = make_dataset(n_s1=60, seed=52)
+    write_split(data, "train", s1, s2, s3)
+    files = {"s1": data / "train/train_source1.tsv", "s2": data / "train/train_source2.tsv",
+            "s3": data / "train/train_source3.tsv"}
+
+    rp.prepare(s1, s2, s3, use_embeddings=False, use_cache=True)
+    arts = isolated / "artifacts"
+    cached_before = {p.name for p in arts.glob("norm_*.parquet")}
+    assert cached_before, "prepare() should have written normalisation caches"
+
+    calls = []
+    real_normalize_frame = rp.normalize_frame
+
+    def counting_normalize_frame(df):
+        calls.append(len(df))
+        return real_normalize_frame(df)
+
+    rp.normalize_frame = counting_normalize_frame
+    try:
+        rp.prepare_from_files(files, use_embeddings=False, use_cache=True)
+    finally:
+        rp.normalize_frame = real_normalize_frame
+    assert calls == [], f"expected a full cache hit, but normalize_frame was called: {calls}"
+    assert {p.name for p in arts.glob("norm_*.parquet")} == cached_before
+
+
+def test_normalize_one_loads_normalises_and_caches_a_single_source(isolated):
+    """_normalize_one() reads one file, normalises it and caches it under the
+    same key prepare() would use for that content -- the primitive
+    prepare_from_files() is built from."""
+    from src.normalize import normalize_frame
+
+    data = isolated / "dataset"
+    s1, _, _, _ = make_dataset(n_s1=40, seed=53)
+    write_split(data, "train", s1, s1.iloc[:0], s1.iloc[:0])
+    path = data / "train/train_source1.tsv"
+
+    got = rp._normalize_one("s1", path, use_cache=True)
+    expected = normalize_frame(rp.read_tsv(path))
+    pd.testing.assert_frame_equal(got.reset_index(drop=True), expected.reset_index(drop=True))
+
+    arts = isolated / "artifacts"
+    cached = list(arts.glob("norm_s1_*.parquet"))
+    assert len(cached) == 1
+
+    # A second call hits the cache instead of recomputing.
+    calls = []
+    real_normalize_frame = rp.normalize_frame
+
+    def counting_normalize_frame(df):
+        calls.append(len(df))
+        return real_normalize_frame(df)
+
+    rp.normalize_frame = counting_normalize_frame
+    try:
+        rp._normalize_one("s1", path, use_cache=True)
+    finally:
+        rp.normalize_frame = real_normalize_frame
+    assert calls == []
 
 
 def test_split_s1_stratified_and_disjoint():

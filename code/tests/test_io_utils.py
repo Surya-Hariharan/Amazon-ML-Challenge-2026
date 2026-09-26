@@ -3,7 +3,8 @@
 import pandas as pd
 import pytest
 
-from src.io_utils import format_id_list, parse_id_list, read_tsv, write_submission
+from src import config
+from src.io_utils import format_id_list, load_source, load_split, parse_id_list, read_tsv, write_submission
 
 S1 = ["S1-1", "S1-2", "S1-3"]
 VALID = {"S2-10", "S2-11", "S3-20", "S3-21"}
@@ -95,6 +96,28 @@ def test_id_list_helpers():
     assert parse_id_list("S2-1,S3-2") == ["S2-1", "S3-2"]
     assert format_id_list(["S2-1", "S3-2", "S2-1"]) == "S2-1,S3-2"
     assert format_id_list([]) == ""
+
+
+def test_load_source_reads_one_file_and_matches_load_split(tmp_path, monkeypatch):
+    """load_source() reads just the requested file; load_split() (now built on
+    top of it) still returns the same content for every file in the split."""
+    train_dir = tmp_path / "train"
+    train_dir.mkdir()
+    s1_path = train_dir / "train_source1.tsv"
+    s2_path = train_dir / "train_source2.tsv"
+    gt_path = train_dir / "train_ground_truth.tsv"
+    s1_path.write_text("entity_id\tbusiness_name\nS1-1\tAcme\n", encoding="utf-8")
+    s2_path.write_text("entity_id\tbusiness_name\nS2-1\tAcme Inc\n", encoding="utf-8")
+    gt_path.write_text("source1_entity_id\tmatched_entity_ids\nS1-1\tS2-1\n", encoding="utf-8")
+    monkeypatch.setattr(config, "TRAIN_FILES", {"s1": s1_path, "s2": s2_path, "ground_truth": gt_path})
+
+    only_s1 = load_source("train", "s1")
+    pd.testing.assert_frame_equal(only_s1, read_tsv(s1_path))
+
+    whole_split = load_split("train")
+    assert set(whole_split) == {"s1", "s2", "ground_truth"}
+    pd.testing.assert_frame_equal(whole_split["s1"], read_tsv(s1_path))
+    pd.testing.assert_frame_equal(whole_split["s2"], read_tsv(s2_path))
 
 
 def test_read_tsv_keeps_strings(tmp_path):

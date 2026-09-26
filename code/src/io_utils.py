@@ -25,13 +25,25 @@ def write_tsv(df: pd.DataFrame, path: str | Path) -> None:
     df.to_csv(path, sep="\t", index=False)
 
 
+def load_source(split: str, key: str) -> pd.DataFrame:
+    """Load a single source file of ``"train"`` or ``"test"`` (e.g. ``key="s2"``).
+
+    The single-file counterpart of :func:`load_split`, for callers that must
+    not have more than one raw source resident at a time (see
+    ``run_pipeline.prepare_from_files``, added for the full-scale training
+    path where S1/S2/S3 must never all be raw-resident simultaneously).
+    """
+    files = {"train": config.TRAIN_FILES, "test": config.TEST_FILES}[split]
+    return read_tsv(files[key])
+
+
 def load_split(split: str) -> dict[str, pd.DataFrame]:
     """Load all source files of ``"train"`` or ``"test"`` as string DataFrames.
 
     Returns a dict keyed like ``config.TRAIN_FILES`` / ``config.TEST_FILES``.
     """
     files = {"train": config.TRAIN_FILES, "test": config.TEST_FILES}[split]
-    return {key: read_tsv(path) for key, path in files.items()}
+    return {key: load_source(split, key) for key in files}
 
 
 def parse_id_list(value: str) -> list[str]:

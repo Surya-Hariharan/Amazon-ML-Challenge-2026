@@ -41,7 +41,7 @@ from .blocking import candidates_to_lists, compute_embeddings, generate_candidat
 from .decide import apply_threshold, tune_threshold
 from .evaluate import score_report
 from .features import FeatureContext, build_features, feature_columns, label_pairs
-from .io_utils import load_split, parse_id_list, write_submission, write_tsv
+from .io_utils import load_split, parse_id_list, read_tsv, write_submission, write_tsv
 from .model import feature_importance, predict, save_model, train_full, train_oof
 from .normalize import normalize_frame
 
@@ -124,6 +124,29 @@ def _cached(name: str, key: str, fn: Callable[[], pd.DataFrame], use_cache: bool
     return df
 
 
+def _normalize_and_cache(name: str, raw: pd.DataFrame, use_cache: bool) -> pd.DataFrame:
+    """Cache-aware normalisation of one already-loaded raw source frame.
+
+    Factored out of :func:`prepare` so :func:`_normalize_one` can share the
+    exact same cache keys/paths (``norm_<name>_<hash>.parquet``) when it loads
+    a source from disk instead of receiving it already in memory.
+    """
+    return _cached(f"norm_{name}", _frame_key(raw), lambda: normalize_frame(raw), use_cache)
+
+
+def _normalize_one(name: str, path: Path, use_cache: bool) -> pd.DataFrame:
+    """Load one raw source TSV from ``path``, then normalise and cache it.
+
+    The raw frame read here is local to this call and is not part of the
+    return value, so once this function returns nothing keeps it alive —
+    letting :func:`prepare_from_files` normalise S1, S2 and S3 one at a time
+    instead of requiring all three raw frames to already be materialised
+    before it can even be called, the way :func:`prepare`'s ``s1``/``s2``/
+    ``s3`` parameters do.
+    """
+    return _normalize_and_cache(name, read_tsv(path), use_cache)
+
+
 def prepare(s1: pd.DataFrame, s2: pd.DataFrame, s3: pd.DataFrame,
             use_embeddings: bool = config.USE_EMBEDDINGS, encoder: Encoder | None = None,
             use_cache: bool = True) -> dict:
@@ -138,12 +161,16 @@ def prepare(s1: pd.DataFrame, s2: pd.DataFrame, s3: pd.DataFrame,
     no cross-row statistics, so normalising then concatenating is equivalent to
     concatenating then normalising.
 
+    This still requires the caller to already hold ``s1``, ``s2`` and ``s3``
+    in memory simultaneously, since they are its parameters — see
+    :func:`prepare_from_files` for the full-scale path that avoids that.
+
     Returns ``{"s1", "others", "emb"}``; ``emb`` is ``(s1_emb, others_emb)`` or None.
     """
     _log(f"normalising {len(s1):,} S1 + {len(s2) + len(s3):,} S2/S3 records")
-    s1n = _cached("norm_s1", _frame_key(s1), lambda: normalize_frame(s1), use_cache)
-    s2n = _cached("norm_s2", _frame_key(s2), lambda: normalize_frame(s2), use_cache)
-    s3n = _cached("norm_s3", _frame_key(s3), lambda: normalize_frame(s3), use_cache)
+    s1n = _normalize_and_cache("s1", s1, use_cache)
+    s2n = _normalize_and_cache("s2", s2, use_cache)
+    s3n = _normalize_and_cache("s3", s3, use_cache)
     on = pd.concat([s2n, s3n], ignore_index=True)
     # s2n/s3n are local to this call (not part of the return value) and pd.concat
     # copies their content into `on` rather than reusing it, so once `on` exists
@@ -151,6 +178,39 @@ def prepare(s1: pd.DataFrame, s2: pd.DataFrame, s3: pd.DataFrame,
     # memory (as large as `on` itself, at full dataset scale) is freed before the
     # embedding pass below runs.
     del s2n, s3n
+    emb = None
+    if use_embeddings:
+        _log("embedding records")
+        emb = (compute_embeddings(s1n, encoder, cache=use_cache),
+               compute_embeddings(on, encoder, cache=use_cache))
+    return {"s1": s1n, "others": on, "emb": emb}
+
+
+def prepare_from_files(files: dict[str, Path], use_embeddings: bool = config.USE_EMBEDDINGS,
+                       encoder: Encoder | None = None, use_cache: bool = True) -> dict:
+    """Sequential-loading equivalent of :func:`prepare`, for full-scale training.
+
+    ``files`` maps ``"s1"``/``"s2"``/``"s3"`` to TSV paths (e.g.
+    ``config.TRAIN_FILES``). Each source is loaded, normalised and cached by
+    :func:`_normalize_one` — and its raw frame released — before the next
+    source is even read, so at most one raw source (plus the much smaller,
+    growing normalised set) is resident at a time. :func:`prepare`, by
+    contrast, requires its ``s1``/``s2``/``s3`` arguments to already be
+    materialised simultaneously by the caller before it can be called at all;
+    this closes off the suspected full-scale bottleneck behind the overnight
+    full-train run never producing a normalised S3 cache.
+
+    Uses the exact same cache keys as :func:`prepare` (see
+    :func:`_normalize_and_cache`), so a normalisation cache built by either
+    function is reused by the other. Returns the same ``{"s1", "others",
+    "emb"}`` shape as :func:`prepare`, with identical content and row order.
+    """
+    _log("normalising sources sequentially (one raw source resident at a time)")
+    s1n = _normalize_one("s1", files["s1"], use_cache)
+    s2n = _normalize_one("s2", files["s2"], use_cache)
+    s3n = _normalize_one("s3", files["s3"], use_cache)
+    on = pd.concat([s2n, s3n], ignore_index=True)
+    del s2n, s3n  # see prepare()'s identical del: on already holds a full copy
     emb = None
     if use_embeddings:
         _log("embedding records")
@@ -269,6 +329,28 @@ def valid_run(s1: pd.DataFrame, s2: pd.DataFrame, s3: pd.DataFrame,
     return metrics
 
 
+def _fit_on_prepared(prep: dict, truth: dict[str, list[str]],
+                     use_cache: bool = True) -> tuple[dict, dict]:
+    """Block, featurise and fit on an already-``prepare``d (normalised) split.
+
+    Factored out of :func:`_train_model` so :func:`_train_model_from_files`
+    — which normalises its sources sequentially via :func:`prepare_from_files`
+    instead of :func:`prepare` — shares the same blocking/feature/fit logic
+    rather than duplicating it.
+    """
+    tr_ids = list(prep["s1"][config.ID_COL])
+    cands_tr = block(prep, use_cache)
+    metrics = {f"block_{k}": v for k, v in report_blocking_stats(
+        cands_tr, truth, tr_ids, len(prep["others"]),
+        dict(zip(tr_ids, prep["s1"][config.COUNTRY_COL]))).items()}
+    feats_tr = build_features(cands_tr, prep["s1"], prep["others"], prep["emb"])
+    feats_tr["label"] = label_pairs(feats_tr, truth)
+    fitted = fit_and_tune(feats_tr, truth, tr_ids)
+    metrics.update(tau=fitted["tau"], singleton_tau=fitted["singleton_tau"],
+                   oof_f05=fitted["oof_f05"])
+    return fitted, metrics
+
+
 def _train_model(s1: pd.DataFrame, s2: pd.DataFrame, s3: pd.DataFrame,
                  truth: dict[str, list[str]], use_embeddings: bool = config.USE_EMBEDDINGS,
                  encoder: Encoder | None = None, use_cache: bool = True) -> tuple[dict, dict]:
@@ -281,19 +363,29 @@ def _train_model(s1: pd.DataFrame, s2: pd.DataFrame, s3: pd.DataFrame,
     reference to for the duration of the call. ``run_test`` relies on exactly this:
     it calls this function to completion (freeing train's raw ~12M rows) *before*
     loading the test split, instead of holding both raw datasets at once.
+
+    Requires the caller to already hold ``s1``, ``s2`` and ``s3`` simultaneously
+    (they are its parameters); see :func:`_train_model_from_files` for the
+    full-scale path that never materialises all three raw sources at once.
     """
     prep_tr = prepare(s1, s2, s3, use_embeddings, encoder, use_cache)
-    tr_ids = list(prep_tr["s1"][config.ID_COL])
-    cands_tr = block(prep_tr, use_cache)
-    metrics = {f"block_{k}": v for k, v in report_blocking_stats(
-        cands_tr, truth, tr_ids, len(prep_tr["others"]),
-        dict(zip(tr_ids, prep_tr["s1"][config.COUNTRY_COL]))).items()}
-    feats_tr = build_features(cands_tr, prep_tr["s1"], prep_tr["others"], prep_tr["emb"])
-    feats_tr["label"] = label_pairs(feats_tr, truth)
-    fitted = fit_and_tune(feats_tr, truth, tr_ids)
-    metrics.update(tau=fitted["tau"], singleton_tau=fitted["singleton_tau"],
-                   oof_f05=fitted["oof_f05"])
-    return fitted, metrics
+    return _fit_on_prepared(prep_tr, truth, use_cache)
+
+
+def _train_model_from_files(files: dict[str, Path], truth: dict[str, list[str]],
+                            use_embeddings: bool = config.USE_EMBEDDINGS,
+                            encoder: Encoder | None = None,
+                            use_cache: bool = True) -> tuple[dict, dict]:
+    """Full-scale counterpart of :func:`_train_model`.
+
+    Loads and normalises S1, S2 and S3 sequentially straight from ``files``
+    via :func:`prepare_from_files`, instead of requiring the caller to already
+    hold all three raw frames in memory the way :func:`_train_model`'s
+    ``s1``/``s2``/``s3`` parameters do. Used by :func:`run_test` for the
+    un-subsampled (``sample >= 1.0``) full-scale path.
+    """
+    prep_tr = prepare_from_files(files, use_embeddings, encoder, use_cache)
+    return _fit_on_prepared(prep_tr, truth, use_cache)
 
 
 def _predict_test(fitted: dict, t1: pd.DataFrame, t2: pd.DataFrame, t3: pd.DataFrame,
@@ -395,10 +487,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _load_train(sample: float):
-    """Load (and optionally sub-sample) the training split from config paths."""
+    """Load (and optionally sub-sample) the training split from config paths.
+
+    Used for sub-sampled runs (``sample < 1.0``), where ``subsample_train``
+    must cross-reference S1, S2 and S3 together to preserve orphan density —
+    that inherently needs all three raw frames in memory at once, so there is
+    nothing to gain from loading them sequentially here. The un-subsampled,
+    full-scale path (``run_test`` at the default ``sample >= 1.0``) instead
+    uses ``_train_model_from_files``, which never materialises all three raw
+    sources simultaneously — see its docstring and :func:`prepare_from_files`.
+    """
     data = load_split("train")
     truth = truth_from_frame(data["ground_truth"])
     return subsample_train(data["s1"], data["s2"], data["s3"], truth, sample)
+
+
+def _load_train_truth() -> dict[str, list[str]]:
+    """Load just the training ground truth, without touching S1/S2/S3.
+
+    Used by :func:`run_test`'s full-scale path, which loads and normalises
+    S1/S2/S3 sequentially via :func:`_train_model_from_files` instead.
+    """
+    return truth_from_frame(read_tsv(config.TRAIN_FILES["ground_truth"]))
 
 
 def _load_test():
@@ -420,14 +530,30 @@ def run_test(sample: float = config.TRAIN_SAMPLE_FRAC,
              use_embeddings: bool = config.USE_EMBEDDINGS, use_cache: bool = True) -> dict:
     """Test mode: train on the training files, write output/ for the test files.
 
-    Calls ``_train_model`` and ``_predict_test`` directly (bypassing ``test_run``,
-    see its docstring) as two separate, sequential calls: the first fully returns
-    -- releasing train's raw S1/S2/S3 (~12M rows at full dataset scale), since
-    nothing here binds them to a name either -- *before* the test split is even
-    loaded. This is the fix for the OOM this pipeline hit at full scale, where
-    both raw datasets were loaded up front and stayed resident for the whole run.
+    At ``sample >= 1.0`` (the default — the full-scale, no-subsampling path),
+    training loads and normalises S1, S2 and S3 sequentially straight from
+    ``config.TRAIN_FILES`` via ``_train_model_from_files``/``prepare_from_files``,
+    so at most one raw source is resident at a time. This replaces the old
+    ``_load_train`` -> ``_train_model`` path, whose ``load_split`` call
+    materialised S1, S2, S3 *and* ground_truth simultaneously before
+    normalisation even began — the full-scale bottleneck this fixes (S1+S2+S3
+    total ~12.5M rows on a 15 GiB instance with no swap). Sub-sampled runs
+    (``sample < 1.0``) still need S1/S2/S3 cross-referenced together to
+    preserve orphan density (see ``subsample_train``), so they fall back to
+    the old ``_load_train``/``_train_model`` raw-frame path; that path is for
+    smaller, iteration-scale runs regardless of this change.
+
+    Either way, the training half and ``_predict_test`` are called as two
+    separate, sequential top-level calls (bypassing ``test_run``, see its
+    docstring): the first fully returns -- releasing every training-time
+    intermediate, since nothing here binds them to a name either -- *before*
+    the test split is even loaded.
     """
-    fitted, metrics = _train_model(*_load_train(sample), use_embeddings, use_cache=use_cache)
+    if sample >= 1.0:
+        fitted, metrics = _train_model_from_files(config.TRAIN_FILES, _load_train_truth(),
+                                                  use_embeddings, use_cache=use_cache)
+    else:
+        fitted, metrics = _train_model(*_load_train(sample), use_embeddings, use_cache=use_cache)
     metrics.update(_predict_test(fitted, *_load_test(), config.OUTPUT_DIR,
                                  use_embeddings, use_cache=use_cache))
     log_experiment({"sample": sample, **metrics}, "test", "all")
