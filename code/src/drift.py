@@ -38,8 +38,8 @@ def record_covariates(raw: pd.DataFrame) -> pd.DataFrame:
     (post-normalisation lengths).
     """
     n = normalize_frame(raw)
-    name_raw = raw[config.NAME_COL].fillna("")
-    addr_raw = raw[config.ADDRESS_COL].fillna("")
+    name_raw = raw[config.NAME_COL].fillna("").reset_index(drop=True)
+    addr_raw = raw[config.ADDRESS_COL].fillna("").reset_index(drop=True)
     return pd.DataFrame({
         "entity_id": raw[config.ID_COL].to_numpy(),
         "country": raw[config.COUNTRY_COL].to_numpy(),

@@ -40,6 +40,76 @@ def test_record_covariates_digit_and_long_num_detection():
     assert cov.loc[0, "digit_count"] >= cov.loc[1, "digit_count"]
 
 
+def test_record_covariates_non_contiguous_index_row_count():
+    """A sampled/shuffled input (non-contiguous, non-zero-based index) must not
+    change the output row count -- this reproduces the reported ValueError where
+    pandas union-aligned raw Series (kept the original index) against normalized
+    Series (reset to a fresh RangeIndex), inflating the row count instead of
+    raising, or raising a length-mismatch error depending on overlap."""
+    raw = _frame([
+        ("S1-1", "Green Traders LLC", "12 Main St, Austin, TX", "US"),
+        ("S1-2", "Acme Inc", "100 Main St, Austin, TX 78701", "US"),
+        ("S1-3", "Café Français", "5 Rue de la Paix", "France"),
+        ("S1-4", "Blue Traders", "9 Oak Ave, Dallas, TX", "US"),
+        ("S1-5", "", "", "US"),
+    ])
+    sampled = raw.sample(n=3, random_state=42)  # non-contiguous, shuffled index
+    assert not sampled.index.equals(pd.RangeIndex(len(sampled)))
+    cov = drift.record_covariates(sampled)
+    assert len(cov) == len(sampled)
+
+
+def test_record_covariates_entity_id_alignment_on_non_contiguous_index():
+    """Covariate rows must line up with the correct entity_id/record after a
+    non-contiguous-index sample, not just match in count."""
+    raw = _frame([
+        ("S1-1", "Green Traders LLC", "12 Main St, Austin, TX", "US"),
+        ("S1-2", "Acme Inc", "100 Main St, Austin, TX 78701", "US"),
+        ("S1-3", "Café Français", "5 Rue de la Paix", "France"),
+        ("S1-4", "Blue Traders", "9 Oak Ave, Dallas, TX", "US"),
+        ("S1-5", "", "", "US"),
+    ])
+    sampled = raw.sample(n=3, random_state=42)
+    cov = drift.record_covariates(sampled)
+    assert list(cov["entity_id"]) == list(sampled["entity_id"])
+    # entity_id S1-3 (Café Français) must keep its own covariates, not another row's.
+    row = cov.loc[cov["entity_id"] == "S1-3"].iloc[0]
+    assert row["non_latin_name"] == 1
+    assert row["name_len"] == len("Café Français")
+
+
+def test_record_covariates_covariate_columns_populated_on_non_contiguous_index():
+    """Covariate values (missingness, digit/long-num detection) are correctly
+    computed per row, not misaligned, when the input index is non-contiguous."""
+    raw = _frame([
+        ("S1-1", "Green Traders LLC", "12 Main St, Austin, TX", "US"),
+        ("S1-2", "Acme Inc", "100 Main St, Austin, TX 78701", "US"),
+        ("S1-3", "Café Français", "5 Rue de la Paix", "France"),
+        ("S1-4", "Blue Traders", "9 Oak Ave, Dallas, TX", "US"),
+        ("S1-5", "", "", "US"),
+    ])
+    sampled = raw.iloc[[4, 1, 0]]  # explicit non-contiguous, non-sorted index
+    cov = drift.record_covariates(sampled).set_index("entity_id")
+    assert cov.loc["S1-5", "name_missing"] == 1
+    assert cov.loc["S1-5", "addr_missing"] == 1
+    assert cov.loc["S1-2", "has_long_num"] == 1  # 78701
+    assert cov.loc["S1-1", "has_long_num"] == 0
+
+
+def test_record_covariates_rangeindex_input_still_works():
+    """A normal, default RangeIndex input (the common case) is unaffected by the fix."""
+    raw = _frame([
+        ("S1-1", "Green Traders LLC", "12 Main St, Austin, TX", "US"),
+        ("S1-2", "", "", "US"),
+        ("S1-3", "Café Français", "5 Rue de la Paix", "France"),
+    ])
+    cov = drift.record_covariates(raw)
+    assert len(cov) == len(raw)
+    assert list(cov["entity_id"]) == list(raw["entity_id"])
+    assert cov.loc[1, "name_missing"] == 1
+    assert cov.loc[2, "non_latin_name"] == 1
+
+
 def test_candidate_covariates_counts_and_missing_s1s():
     """n_candidates is the group size per s1_id; S1s with no rows get 0/NaN."""
     cands = pd.DataFrame({
