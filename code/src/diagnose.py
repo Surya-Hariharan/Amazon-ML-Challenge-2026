@@ -18,6 +18,7 @@ Usage (from code/business_entity_resolution/)::
     python -m src.diagnose resource-stage --stage normalize|embed|block|features|all
     python -m src.diagnose errors [--sample 0.1] [--no-embeddings]
     python -m src.diagnose blocking-ablation [--sample 0.0045] [--no-embeddings]
+    python -m src.diagnose blocking-k-downstream [--sample 0.0045] [--no-embeddings]
 
 Every subcommand is measurement-only: none of them changes ``output/``, and
 none of them is wired to run automatically -- each is a separate, explicit CLI
@@ -40,10 +41,11 @@ from . import drift as drift_mod
 from . import error_decomposition as edecomp
 from . import run_pipeline as rp
 from .blocking import generate_candidates, report_blocking_stats
-from .decide import apply_threshold
+from .decide import apply_threshold, tune_threshold
+from .evaluate import score_report
 from .features import build_features, feature_columns, label_pairs
 from .io_utils import load_source, load_split
-from .model import predict
+from .model import group_folds, predict, train_full, train_oof
 
 DIAG_DIR = config.ARTIFACTS_DIR / "diagnostics"
 
@@ -491,6 +493,221 @@ def run_blocking_ablation(
     return out
 
 
+# --- P1-downstream: blocking-K OOF validation ---------------------------------------------
+
+#: The 4 Pareto-competitive configurations P1's blocking-only screening surfaced
+#: (roadmap v3 P1 follow-up). Unlike ``_ABLATION_SWEEPS`` (16 one-factor-at-a-time
+#: blocking-only rows), this is a small, fixed, *named* set run through the full
+#: downstream pipeline (features -> LightGBM -> threshold -> decision), in this
+#: exact order, because that ordering is part of the deliverable.
+_DOWNSTREAM_ORDER = ("baseline", "tfidf40", "embed40", "both40")
+
+
+def blocking_k_downstream_configs() -> list[dict]:
+    """The 4 named blocking-K configurations for the P1-downstream OOF experiment.
+
+    Reads the production baseline live from ``config`` (via
+    :func:`blocking_ablation_baseline`, never duplicated as literals), then applies
+    exactly the K changes P1's blocking-only screening reported as Pareto-competitive:
+    ``tfidf40`` raises only TF-IDF K to 40, ``embed40`` raises only embedding K to 40,
+    ``both40`` raises both. ``rare``/``digit``/``address`` K stay at the production
+    baseline in every configuration -- the only experimental variable across these 4
+    rows is TF-IDF/embedding K, per the task's methodological requirement. Returned in
+    the deterministic order (baseline, tfidf40, embed40, both40) the experiment must
+    run in.
+    """
+    baseline = blocking_ablation_baseline()
+    by_name = {
+        "baseline": dict(baseline),
+        "tfidf40": {**baseline, "tfidf": 40},
+        "embed40": {**baseline, "embed": 40},
+        "both40": {**baseline, "tfidf": 40, "embed": 40},
+    }
+    return [{"name": n, **by_name[n]} for n in _DOWNSTREAM_ORDER]
+
+
+def _fit_and_tune_with_oof(feats: pd.DataFrame, truth: dict[str, list[str]],
+                           s1_ids: list[str]) -> dict:
+    """Reproduce ``run_pipeline.fit_and_tune``'s exact computation, additionally
+    exposing the OOF probabilities and GroupKFold fold id per row.
+
+    ``fit_and_tune`` itself only returns a flat summary (model, tau, singleton_tau,
+    oof_f05, grid, fold_models) -- fold-stability reporting needs the per-row OOF
+    predictions and which fold each row was held out in, so this calls the exact same
+    public functions (``model.group_folds``, ``model.train_oof``,
+    ``decide.tune_threshold``, ``model.train_full``), in the same order, with the same
+    arguments ``fit_and_tune`` uses, purely to additionally capture those
+    intermediates. This changes no training, tuning or fold-assignment behaviour and
+    does not modify ``model.py``/``run_pipeline.py`` -- ``model.group_folds`` is
+    deterministic (sklearn ``GroupKFold``), so calling it here on the same ``groups``
+    ``train_oof`` uses internally reproduces the identical fold assignment.
+    """
+    cols = feature_columns(feats)
+    X, y, groups = feats[cols], feats["label"].to_numpy(), feats["s1_id"]
+    folds = group_folds(groups, config.N_FOLDS)
+    oof, fold_models = train_oof(X, y, groups, verbose=False)
+    scored = feats[["s1_id", "cand_id"]].assign(prob=oof)
+    tau, stau, f05, grid = tune_threshold(scored, truth, s1_ids)
+    model = train_full(X, y, fold_models=fold_models)
+    return {"model": model, "tau": tau, "singleton_tau": stau, "oof_f05": f05,
+            "grid": grid, "fold_models": fold_models, "oof": oof, "folds": folds,
+            "scored": scored}
+
+
+def _fold_stability(scored: pd.DataFrame, folds: np.ndarray, tau: float,
+                    singleton_tau: float | None, truth: dict[str, list[str]]) -> dict:
+    """Per-fold macro F0.5 from OOF predictions, using the one tuned threshold pair.
+
+    Each GroupKFold fold holds a disjoint set of S1 groups (``model.group_folds``'
+    contract), so ``scored`` rows in fold ``f`` are exactly the out-of-fold
+    predictions for the S1s validated in that fold -- unbiased, the same way the
+    headline OOF macro F0.5 is. The single ``(tau, singleton_tau)`` from the full OOF
+    sweep is reused for every fold (task requirement 10: no per-fold threshold
+    re-tuning), so this measures how stable the *chosen* operating point is across
+    folds, not how well each fold could have done with its own threshold.
+    """
+    s1_col = scored["s1_id"].to_numpy()
+    per_fold: list[float] = []
+    for f in sorted(set(int(v) for v in folds) - {-1}):
+        mask = folds == f
+        fold_s1 = sorted(set(s1_col[mask]))
+        if not fold_s1:
+            continue
+        pred = apply_threshold(scored[mask], tau, fold_s1, singleton_tau)
+        per_fold.append(score_report(pred, truth, fold_s1)["macro_f05"])
+    arr = np.array(per_fold, dtype=float)
+    return {
+        "fold_f05": per_fold,
+        "fold_f05_mean": float(arr.mean()) if len(arr) else float("nan"),
+        "fold_f05_std": float(arr.std(ddof=0)) if len(arr) else float("nan"),
+    }
+
+
+def run_blocking_k_downstream(sample: float = 0.0045, use_embeddings: bool = True) -> pd.DataFrame:
+    """P1-downstream: full blocking->features->LightGBM->threshold->decision OOF
+    validation for the 4 Pareto-competitive blocking-K configurations P1's cheap
+    blocking-only screening surfaced (``blocking_k_downstream_configs``).
+
+    P1's ``blocking-ablation`` only measures blocking recall; it cannot say whether
+    the extra candidates it buys actually improve the complete pipeline's macro F0.5,
+    since more candidates also means more opportunities for the matcher to produce a
+    false positive. This closes that gap by running each configuration all the way
+    through -- exactly the existing, unmodified pipeline functions
+    ``run_pipeline.prepare``, ``blocking.generate_candidates``,
+    ``blocking.report_blocking_stats``, ``features.build_features``,
+    ``features.label_pairs``, the GroupKFold OOF machinery in ``model.py``,
+    ``decide.tune_threshold``/``apply_threshold`` and ``evaluate.score_report`` -- in
+    the same order and with the same arguments production ``run_pipeline.valid_run``
+    uses, so the only experimental variable across the 4 rows is blocking K.
+
+    Normalisation and embeddings are computed exactly once (via ``run_pipeline.prepare``
+    with its normal on-disk caches), then reused for every configuration by calling
+    ``blocking.generate_candidates`` directly with that configuration's ``k_overrides``
+    -- mirroring ``run_blocking_ablation``'s cache-reuse strategy. The
+    train/valid S1 split (``run_pipeline.split_s1``) is computed once, before the
+    configuration loop, and reused identically for every configuration, so a
+    difference between rows can never be attributed to a different split.
+
+    Each configuration's ``cands`` frame is used, unmodified, for both its blocking
+    stats *and* its feature generation -- the same candidate set that is measured is
+    the one the matcher scores (task requirement 8). If a configuration raises, its
+    row is recorded with ``status="failed"`` and the exception message, and the
+    remaining configurations still run (task requirement 12) -- nothing here silently
+    swallows a failure or skips a configuration without a row.
+
+    Writes one row per configuration to
+    ``artifacts/diagnostics/blocking_k_downstream_<timestamp>.tsv`` and a sidecar
+    ``blocking_k_downstream_<timestamp>.json`` (git commit, dataset hashes, env info,
+    the exact configuration matrix, and any failures) mirroring
+    ``run_blocking_ablation``'s report shape. Returns the same frame. Does not touch
+    ``output/``, ``run_pipeline.py`` or any ``config.py`` default -- it only ever
+    calls ``blocking.generate_candidates`` with an explicit ``k_overrides`` dict built
+    from configuration values read live off ``config`` at call time.
+    """
+    s1, s2, s3, truth = rp._load_train(sample)
+    prep = rp.prepare(s1, s2, s3, use_embeddings=use_embeddings, use_cache=True)
+    s1_ids = list(prep["s1"][config.ID_COL])
+    s1_country = dict(zip(prep["s1"][config.ID_COL], prep["s1"][config.COUNTRY_COL]))
+    n_other = len(prep["others"])
+    train_ids, valid_ids = rp.split_s1(s1_ids, truth)
+    configs = blocking_k_downstream_configs()
+    _log(f"blocking-K downstream: {len(configs)} configurations, "
+        f"{len(s1_ids):,} S1 x {n_other:,} others (sample={sample})")
+
+    rows: list[dict] = []
+    failures: list[str] = []
+    for cfg in configs:
+        name = cfg["name"]
+        k_overrides = {k: v for k, v in cfg.items() if k != "name"}
+        _log(f"blocking-K downstream: running '{name}' (k={k_overrides})")
+        try:
+            with diag.ResourceTracker() as rt:
+                cands = generate_candidates(
+                    prep["s1"], prep["others"], embeddings=prep["emb"],
+                    verbose=False, k_overrides=k_overrides)
+                block_stats = report_blocking_stats(
+                    cands, truth, s1_ids, n_other, s1_country, verbose=False)
+                feats = build_features(cands, prep["s1"], prep["others"], prep["emb"])
+                feats["label"] = label_pairs(feats, truth)
+                in_train = feats["s1_id"].isin(set(train_ids)).to_numpy()
+                feats_train = feats[in_train]
+                fit = _fit_and_tune_with_oof(feats_train, truth, train_ids)
+                stability = _fold_stability(fit["scored"], fit["folds"], fit["tau"],
+                                            fit["singleton_tau"], truth)
+                valid_feats = feats[~in_train]
+                valid_scored = valid_feats[["s1_id", "cand_id"]].assign(
+                    prob=predict(fit["model"], valid_feats[feature_columns(feats)]))
+                pred = apply_threshold(valid_scored, fit["tau"], valid_ids, fit["singleton_tau"])
+                report = score_report(pred, truth, valid_ids, groups=s1_country)
+            row = {
+                "experiment": name, "status": "ok",
+                **{f"k_{k}": v for k, v in k_overrides.items()},
+                "sample": sample, "n_s1": len(s1_ids), "n_other": n_other,
+                **{f"block_{k}": v for k, v in block_stats.items()},
+                "n_feature_rows": len(feats),
+                "oof_macro_f05": fit["oof_f05"],
+                "tau": fit["tau"], "singleton_tau": fit["singleton_tau"],
+                **{f"valid_{k}": v for k, v in report.items()},
+                "fold_f05": ";".join(f"{v:.4f}" for v in stability["fold_f05"]),
+                "fold_f05_mean": stability["fold_f05_mean"],
+                "fold_f05_std": stability["fold_f05_std"],
+                "runtime_seconds": rt.report["runtime_s"],
+                "peak_rss_bytes": rt.report["peak_rss_bytes"],
+                "current_rss_bytes": rt.report["current_rss_bytes"],
+            }
+            _log(f"blocking-K downstream: '{name}' OOF macro F0.5={fit['oof_f05']:.4f} "
+                f"valid macro F0.5={report['macro_f05']:.4f} "
+                f"(fold mean={stability['fold_f05_mean']:.4f} "
+                f"std={stability['fold_f05_std']:.4f})")
+        except Exception as exc:  # noqa: BLE001 -- one failing config must not stop the rest
+            row = {
+                "experiment": name, "status": "failed", "error": str(exc),
+                **{f"k_{k}": v for k, v in k_overrides.items()},
+                "sample": sample, "n_s1": len(s1_ids), "n_other": n_other,
+            }
+            failures.append(name)
+            _log(f"blocking-K downstream: '{name}' FAILED: {exc}")
+        rows.append(row)
+
+    out = pd.DataFrame(rows)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    DIAG_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = DIAG_DIR / f"blocking_k_downstream_{ts}.tsv"
+    out.to_csv(out_path, sep="\t", index=False)
+    meta = {
+        "kind": "blocking_k_downstream", "timestamp": ts, "sample": sample,
+        "use_embeddings": use_embeddings, "n_s1": len(s1_ids), "n_other": n_other,
+        "configs": configs, "order": list(_DOWNSTREAM_ORDER), "failures": failures,
+        "git_commit": rp._git_hash(),
+        "dataset_file_hashes": diag.dataset_file_hashes(config.TRAIN_FILES),
+        "env": diag.env_info(),
+    }
+    diag.save_json(meta, DIAG_DIR / f"blocking_k_downstream_{ts}.json")
+    _log(f"blocking-K downstream report written to {out_path}"
+        + (f" ({len(failures)} failure(s): {failures})" if failures else ""))
+    return out
+
+
 # --- CLI ---------------------------------------------------------------------------------
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -528,6 +745,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     k.add_argument("--no-embeddings", action="store_true",
                    help="skip the embedding pass entirely (embed-K rows become no-ops)")
 
+    kd = sub.add_parser(
+        "blocking-k-downstream",
+        help="P1-downstream: full blocking->model->decision OOF validation for "
+             "P1's 4 Pareto-competitive blocking-K configurations")
+    kd.add_argument("--sample", type=float, default=0.0045,
+                    help="S1 sample fraction (default: 0.0045, the reproducible baseline scale)")
+    kd.add_argument("--no-embeddings", action="store_true",
+                    help="skip the embedding pass entirely")
+
     return parser.parse_args(argv)
 
 
@@ -546,6 +772,8 @@ def main(argv: list[str] | None = None) -> None:
         run_error_decomposition(args.sample, not args.no_embeddings)
     elif args.command == "blocking-ablation":
         run_blocking_ablation(args.sample, not args.no_embeddings)
+    elif args.command == "blocking-k-downstream":
+        run_blocking_k_downstream(args.sample, not args.no_embeddings)
 
 
 if __name__ == "__main__":
