@@ -59,11 +59,13 @@ def test_run_baseline_produces_a_report_with_loco(isolated, train_files):
 
 
 def test_run_convergence_holds_settings_fixed_across_sizes(isolated, train_files):
-    """E-convergence runs at each requested size and reports per-size metrics."""
+    """E-convergence runs at each requested size and reports per-size metrics,
+    including the total candidate-pair count (not just the mean)."""
     out = diagnose.run_convergence([60, 120], use_embeddings=False)
     assert list(out["requested_n"]) == [60, 120]
     assert (out["actual_n_s1"] <= [60, 120]).all()
     assert out["valid_macro_f05"].notna().all()
+    assert out["block_n_pairs"].notna().all() and (out["block_n_pairs"] > 0).all()
     files = list(diagnose.DIAG_DIR.glob("convergence_*.tsv"))
     assert len(files) == 1
 
@@ -99,6 +101,38 @@ def test_run_drift_compares_train_and_test_without_labels(isolated, train_files,
     shares = out["country_share"].set_index("country")
     assert "France" in shares.index
     assert shares.loc["France", "train_share"] == 0.0  # France never appears in train
+
+
+def test_run_drift_without_candidates_never_loads_s2_or_s3(isolated, train_files, tmp_path,
+                                                            monkeypatch):
+    """The plain drift comparison (no --with-candidates) must load only S1 from each
+    split -- load_split (which would materialise every S2/S3 record too) must not be
+    called at all in that path."""
+    t1, t2, t3, _ = make_dataset(n_s1=50, seed=23)
+    data = tmp_path / "dataset"
+    write_split(data, "test", t1, t2, t3)
+    monkeypatch.setattr(config, "TEST_FILES", {
+        "s1": data / "test/test_source1.tsv", "s2": data / "test/test_source2.tsv",
+        "s3": data / "test/test_source3.tsv"})
+
+    def fail_if_called(split):
+        raise AssertionError(f"load_split({split!r}) must not be called without --with-candidates")
+
+    monkeypatch.setattr(diagnose, "load_split", fail_if_called)
+    out = diagnose.run_drift(sample=1.0, with_candidates=False, use_embeddings=False)
+    assert not out["distributions"].empty
+
+
+def test_warn_if_missing_logs_only_when_cache_absent(isolated, capsys):
+    """_warn_if_missing prints a warning when the glob matches nothing, and stays
+    silent when a matching artifact is present."""
+    diagnose._warn_if_missing("norm_*.parquet", "embed", "normalize")
+    assert "WARNING" in capsys.readouterr().out
+
+    (config.ARTIFACTS_DIR).mkdir(parents=True, exist_ok=True)
+    (config.ARTIFACTS_DIR / "norm_s1_deadbeef.parquet").write_bytes(b"")
+    diagnose._warn_if_missing("norm_*.parquet", "embed", "normalize")
+    assert "WARNING" not in capsys.readouterr().out
 
 
 def test_run_resource_stage_stops_after_first_failure(isolated, monkeypatch):

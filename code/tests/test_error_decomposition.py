@@ -184,6 +184,19 @@ def test_classify_true_pairs_assigns_each_stage_correctly(scenario):
     assert not bool(by_s1.loc["S1-2", "postal_or_long_num_lost"])
 
 
+def test_classify_true_pairs_with_no_candidates_at_all(scenario):
+    """An empty candidate frame -- blocking found nothing for anyone -- must resolve
+    every true pair to representation_failure or blocking_false_negative, never to
+    a matcher/decision/correct stage (those require the pair to be a candidate)."""
+    empty_cands = scenario["cands"].iloc[0:0]
+    empty_scored = scenario["scored"].iloc[0:0]
+    out = edecomp.classify_true_pairs(
+        scenario["s1"], scenario["others"], empty_cands, empty_scored,
+        {}, scenario["truth"], scenario["tau"])
+    assert set(out["stage"]) <= {"representation_failure", "blocking_false_negative"}
+    assert len(out) == sum(len(v) for v in scenario["truth"].values())
+
+
 def test_classify_true_pairs_empty_truth_returns_empty_frame(scenario):
     """No true pairs -> an empty, correctly-columned frame, not an error."""
     out = edecomp.classify_true_pairs(
@@ -255,3 +268,26 @@ def test_slice_report_shares_sum_to_one_per_slice_value(scenario):
     assert not sl.empty
     totals = sl.groupby(["slice_dim", "slice_value"])["share"].sum()
     assert (totals.round(6) == 1.0).all()
+
+
+def test_slice_report_without_country_still_produces_other_dims(scenario):
+    """s1_country=None skips the country dimension but every other slice still works."""
+    classified = edecomp.classify_true_pairs(
+        scenario["s1"], scenario["others"], scenario["cands"], scenario["scored"],
+        scenario["pred"], scenario["truth"], scenario["tau"])
+    sl = edecomp.slice_report(classified, scenario["s1"], scenario["others"],
+                              scenario["cands"], s1_country=None)
+    assert not sl.empty
+    assert "country" not in set(sl["slice_dim"])
+    assert "candidate_bucket" in set(sl["slice_dim"])
+
+
+def test_slice_report_empty_classified_returns_empty_frame(scenario):
+    """An empty classified frame (e.g. no true pairs) yields an empty, correctly-
+    columned slice report rather than raising."""
+    empty = edecomp.classify_true_pairs(
+        scenario["s1"], scenario["others"], scenario["cands"], scenario["scored"],
+        scenario["pred"], {}, scenario["tau"])
+    sl = edecomp.slice_report(empty, scenario["s1"], scenario["others"], scenario["cands"])
+    assert sl.empty
+    assert list(sl.columns) == ["slice_dim", "slice_value", "stage", "count", "share"]

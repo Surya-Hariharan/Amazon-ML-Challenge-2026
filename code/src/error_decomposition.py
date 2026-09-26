@@ -200,28 +200,39 @@ def classify_true_pairs(
                   if len(scored) else pd.Series(dtype=float))
     pred_key = {(s, c) for s, cs in pred.items() for c in cs}
 
+    keys = list(zip(df["s1_id"], df["cand_id"]))
+    in_cands = np.fromiter((k in cand_key for k in keys), dtype=bool, count=len(keys))
     s1_pos = pd.Index(s1[config.ID_COL]).get_indexer(df["s1_id"])
     o_pos = pd.Index(others[config.ID_COL]).get_indexer(df["cand_id"])
 
-    stages: list[str] = []
-    loss_rows: list[dict[str, bool]] = []
-    for i, (s, c) in enumerate(zip(df["s1_id"], df["cand_id"])):
-        if (s, c) not in cand_key:
-            flags = (representation_loss_flags(s1.iloc[s1_pos[i]], others.iloc[o_pos[i]])
-                    if s1_pos[i] >= 0 and o_pos[i] >= 0 else dict(_NO_LOSS))
-            stages.append("representation_failure" if any(flags.values())
-                         else "blocking_false_negative")
-            loss_rows.append(flags)
-            continue
-        loss_rows.append(dict(_NO_LOSS))
-        prob = scored_prob.get((s, c), np.nan)
-        if not (prob >= tau):
-            stages.append("matcher_false_negative")
-        elif (s, c) not in pred_key:
-            stages.append("decision_false_negative")
-        else:
-            stages.append("correct_match")
-    return pd.concat([df.assign(stage=stages), pd.DataFrame(loss_rows)], axis=1)
+    # Representation-loss flags only ever mean something for a pair blocking
+    # missed -- default every row to "no loss" and only run the (comparatively
+    # expensive) per-pair mechanical check for that (usually small) subset,
+    # instead of allocating a fresh all-False dict per row for every pair
+    # blocking already found (the majority population when recall is good).
+    loss_df = pd.DataFrame(False, index=df.index, columns=list(LOSS_KEYS))
+    stages = np.empty(len(df), dtype=object)
+
+    for i in np.flatnonzero(~in_cands):
+        flags = (representation_loss_flags(s1.iloc[s1_pos[i]], others.iloc[o_pos[i]])
+                if s1_pos[i] >= 0 and o_pos[i] >= 0 else dict(_NO_LOSS))
+        loss_df.iloc[i] = [flags[k] for k in LOSS_KEYS]
+        stages[i] = ("representation_failure" if any(flags.values())
+                    else "blocking_false_negative")
+
+    cand_idx = np.flatnonzero(in_cands)
+    if len(cand_idx):
+        cand_keys = [keys[i] for i in cand_idx]
+        probs = np.fromiter((scored_prob.get(k, np.nan) for k in cand_keys),
+                            dtype=float, count=len(cand_keys))
+        below_tau = ~(probs >= tau)
+        not_predicted = np.fromiter((k not in pred_key for k in cand_keys),
+                                    dtype=bool, count=len(cand_keys))
+        stages[cand_idx] = np.where(
+            below_tau, "matcher_false_negative",
+            np.where(not_predicted, "decision_false_negative", "correct_match"))
+
+    return pd.concat([df.assign(stage=stages), loss_df], axis=1)
 
 
 def false_positive_report(

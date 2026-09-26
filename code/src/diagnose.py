@@ -40,7 +40,7 @@ from . import error_decomposition as edecomp
 from . import run_pipeline as rp
 from .decide import apply_threshold
 from .features import build_features, feature_columns, label_pairs
-from .io_utils import load_split
+from .io_utils import load_source, load_split
 from .model import predict
 
 DIAG_DIR = config.ARTIFACTS_DIR / "diagnostics"
@@ -86,16 +86,26 @@ def run_drift(sample: float = 1.0, with_candidates: bool = False,
              use_embeddings: bool = config.USE_EMBEDDINGS) -> dict[str, pd.DataFrame]:
     """E-drift: label-free train-vs-test covariate distribution comparison.
 
-    Loads S1 (+ S2/S3 if ``with_candidates``) from both splits, computes
-    :func:`drift.record_covariates`, and reports
+    Loads only S1 from both splits when ``with_candidates=False`` (the plain
+    covariate comparison never reads S2/S3) -- ``load_split`` would otherwise
+    materialise every S2/S3 record of both splits (~20M unused raw rows at
+    full scale) just to leave them unread for the entire call. S1+S2+S3 are
+    only loaded (via :func:`io_utils.load_split`) when ``with_candidates``
+    actually needs them for blocking.
+
+    Computes :func:`drift.record_covariates`, and reports
     :func:`drift.compare_distributions` plus :func:`drift.compare_country_share`.
     If ``with_candidates``, also runs blocking on both splits (this is the
     expensive path -- it needs embeddings/candidate generation) and adds
     :func:`drift.candidate_covariates` (candidate-count and top-candidate-
     score distributions) to the comparison. No test label is read at any point.
     """
-    train = load_split("train")
-    test = load_split("test")
+    if with_candidates:
+        train = load_split("train")
+        test = load_split("test")
+    else:
+        train = {"s1": load_source("train", "s1")}
+        test = {"s1": load_source("test", "s1")}
     if sample < 1.0:
         train["s1"] = train["s1"].sample(frac=sample, random_state=config.SEED)
 
@@ -135,8 +145,25 @@ def run_convergence(sizes: list[int], use_embeddings: bool = config.USE_EMBEDDIN
     ``run_pipeline.subsample_train``'s output for that fraction -- i.e. every
     other setting (config, architecture, seed) is held fixed, exactly as
     roadmap v3 requires. Returns one row per size with pair recall, S1 full
-    recall, mean candidates, precision, recall, macro F0.5 and runtime;
-    also written to ``artifacts/diagnostics/convergence_<ts>.tsv``.
+    recall, mean candidates, total candidate pairs, precision, recall, macro
+    F0.5 and runtime; also written to ``artifacts/diagnostics/convergence_<ts>.tsv``.
+
+    Two measurement caveats, worth reading before comparing rows:
+
+    * Each ``N``'s subsample is an *independent* random draw from the full
+      S1 set (``subsample_train`` calls ``.sample(frac=..., random_state=
+      config.SEED)`` fresh per ``N``). Pandas' ``.sample()`` does not
+      guarantee that a larger ``frac``'s sample is a superset of a smaller
+      ``frac``'s sample even with the same seed, so a non-monotonic wobble
+      between two ``N`` values can be sampling-composition variance, not
+      "instability from more data" -- it is not a nested/telescoping series.
+    * ``peak_rss_bytes`` in each row is a *process-lifetime* high-water mark
+      (see :class:`diagnostics.ResourceTracker`) and this function measures
+      every ``N`` inside one process, in a loop -- so a later row's
+      ``peak_rss_bytes`` can be inflated by an earlier row's memory use, not
+      isolated to that row alone. ``current_rss_bytes`` (a genuine snapshot,
+      not a running maximum) is the less-contaminated column to compare
+      across rows.
     """
     s1, s2, s3, truth = rp._load_train(1.0)
     rows = []
@@ -152,6 +179,7 @@ def run_convergence(sizes: list[int], use_embeddings: bool = config.USE_EMBEDDIN
             "block_pair_recall": m.get("block_pair_recall"),
             "block_s1_full_recall": m.get("block_s1_full_recall"),
             "block_mean_candidates": m.get("block_mean_candidates"),
+            "block_n_pairs": m.get("block_n_pairs"),
             "valid_pair_precision": m.get("valid_pair_precision"),
             "valid_pair_recall": m.get("valid_pair_recall"),
             "valid_macro_f05": m.get("valid_macro_f05"),
@@ -167,6 +195,23 @@ def run_convergence(sizes: list[int], use_embeddings: bool = config.USE_EMBEDDIN
 
 # --- E2: staged resource qualification ---------------------------------------------------
 
+def _warn_if_missing(glob: str, this_stage: str, prior_stage: str) -> None:
+    """Log a warning if a prior stage's expected cache artifacts are absent.
+
+    Each staged function below assumes the prior stage already ran and left
+    its cache on disk, so its own measured window covers only its own work.
+    If that assumption doesn't hold (e.g. a clean ``artifacts/`` directory,
+    or stages run out of order), the missing prior stage's normalisation/
+    embedding/blocking work happens silently *inside* this stage's measured
+    time/memory instead -- this warning makes that mislabelling visible in
+    the log rather than letting the report imply a number it doesn't mean.
+    """
+    if not list(config.ARTIFACTS_DIR.glob(glob)):
+        _log(f"WARNING: no '{glob}' cache found -- stage '{this_stage}' will also "
+            f"perform (and be charged for) stage '{prior_stage}''s work, since its "
+            f"prerequisite cache is missing")
+
+
 def _stage_normalize() -> dict:
     """Stage 1: full-scale sequential normalisation of the configured train files."""
     def fn():
@@ -177,6 +222,8 @@ def _stage_normalize() -> dict:
 
 def _stage_embed() -> dict:
     """Stage 2: full-scale embedding generation (requires stage 1's normalised cache)."""
+    _warn_if_missing("norm_*.parquet", "embed", "normalize")
+
     def fn():
         rp.prepare_from_files(config.TRAIN_FILES, use_embeddings=True, use_cache=True)
     artifacts = list((config.ARTIFACTS_DIR).glob("emb_*.npy"))
@@ -185,6 +232,9 @@ def _stage_embed() -> dict:
 
 def _stage_block() -> dict:
     """Stage 3: full-scale blocking/dense retrieval (requires stages 1-2's caches)."""
+    _warn_if_missing("norm_*.parquet", "block", "normalize")
+    _warn_if_missing("emb_*.npy", "block", "embed")
+
     def fn():
         prep = rp.prepare_from_files(config.TRAIN_FILES, use_embeddings=True, use_cache=True)
         rp.block(prep, use_cache=True)
@@ -194,6 +244,10 @@ def _stage_block() -> dict:
 
 def _stage_features() -> dict:
     """Stage 4: full-scale feature generation (requires stages 1-3's caches)."""
+    _warn_if_missing("norm_*.parquet", "features", "normalize")
+    _warn_if_missing("emb_*.npy", "features", "embed")
+    _warn_if_missing("cands_*.parquet", "features", "block")
+
     def fn():
         prep = rp.prepare_from_files(config.TRAIN_FILES, use_embeddings=True, use_cache=True)
         cands = rp.block(prep, use_cache=True)
