@@ -22,6 +22,7 @@ Usage (from code/business_entity_resolution/)::
     python -m src.diagnose chunk-equality [--sample 0.0045]
     python -m src.diagnose fp16-retrieval [--sample 0.0045]
     python -m src.diagnose decision-validation [--sample 0.0045] [--no-embeddings]
+    python -m src.diagnose loco [--sample 0.0045] [--no-embeddings]
 
 Every subcommand is measurement-only: none of them changes ``output/``, and
 none of them is wired to run automatically -- each is a separate, explicit CLI
@@ -46,7 +47,7 @@ from . import run_pipeline as rp
 from .blocking import country_groups, dense_topk, generate_candidates, report_blocking_stats
 from .decide import apply_threshold, assign_one_to_one, tune_threshold
 from .evaluate import blocking_recall, score_report
-from .features import build_features, feature_columns, label_pairs
+from .features import FeatureContext, build_features, feature_columns, label_pairs
 from .io_utils import load_source, load_split
 from .model import group_folds, predict, train_full, train_oof
 
@@ -1542,6 +1543,244 @@ def run_decision_validation(sample: float = 0.0045, use_embeddings: bool = True)
     return out
 
 
+# --- LOCO generalization comparison ---------------------------------------------------------
+
+#: The two candidate configurations compared: production's "baseline" 20/20 K and
+#: the P1-downstream/P3-validated "both40" 40/40 K. Only tfidf/embed K differ --
+#: rare/digit/address stay at their production defaults, matching every earlier
+#: P1/P3 comparison of these two configurations.
+LOCO_CONFIGS: list[dict] = [
+    {"name": "baseline", "tfidf": 20, "embed": 20, "rare": 10, "digit": 10, "address": 10},
+    {"name": "both40", "tfidf": 40, "embed": 40, "rare": 10, "digit": 10, "address": 10},
+]
+
+#: Documentation of how this diagnostic satisfies each item of the LOCO leakage
+#: checklist -- written once and recorded verbatim in every run's JSON sidecar, not
+#: derived from data, so a reader can audit the *design* independently of any one
+#: run's numbers. Item 5 (feature statistics) is the one place this diagnostic
+#: deliberately does NOT reuse ``run_pipeline.valid_run``'s own ``loco=True`` branch:
+#: that branch calls ``build_features`` once on the full pooled (all-countries)
+#: frame before splitting by country, so its ``features.FeatureContext`` TF-IDF
+#: vectorizers see the held-out country's own vocabulary. This module's
+#: :func:`_loco_fold` instead fits ``FeatureContext`` on the training side only and
+#: passes that same context explicitly into both sides' ``build_features`` calls,
+#: closing that gap without touching ``features.py`` or ``run_pipeline.py``.
+LOCO_LEAKAGE_CHECKS: dict[str, str] = {
+    "validation_not_in_training": (
+        "The held-out country's S1 rows never appear in feats_tr -- _country_split "
+        "partitions prep['s1']/prep['others'] by an exact country-equality mask before "
+        "any feature/model code runs, so X/y for train_oof/train_full never include a "
+        "held-out-country row."),
+    "no_held_out_labels_used_in_training": (
+        "label_pairs(feats_tr, truth) is computed only on feats_tr (training-country "
+        "pairs). feats_ho's labels are computed too, but only for score_report's "
+        "evaluation after prediction -- never referenced by train_oof/train_full."),
+    "threshold_tuning_scope": (
+        "tune_threshold(oof_scored, truth, tr_ids) restricts its macro-F0.5 sweep "
+        "universe to tr_ids (training-country S1 IDs only); truth.get(s) for a "
+        "held-out-country s1_id is never looked up during tuning."),
+    "candidate_generation_scope": (
+        "generate_candidates is called twice per fold, once on the train-only (s1, "
+        "others) subset and once on the held-out-only subset -- neither call's query "
+        "or index pool includes the other side's records, so blocking cannot use "
+        "held-out records as candidates for training S1s or vice versa."),
+    "feature_statistics_scope": (
+        "FeatureContext.fit(tr['s1'], tr['others']) is fit ONLY on training-country "
+        "records; the same fitted ctx is passed explicitly (build_features(..., "
+        "ctx=ctx)) to build features for BOTH sides, so TF-IDF IDF weights never see "
+        "held-out-country vocabulary. (This is the one respect in which "
+        "run_pipeline.valid_run's own loco=True branch pools FeatureContext across "
+        "all countries before splitting -- fixed here at the diagnostic layer only; "
+        "features.py is unmodified.)"),
+    "embeddings_are_unsupervised": (
+        "Sentence embeddings come from a frozen, pretrained encoder applied per-record "
+        "in run_pipeline.prepare(), before any train/held-out split exists -- no label "
+        "ever reaches the encoder, satisfying the task's explicit exception for "
+        "embeddings."),
+    "group_s1_separation_maintained": (
+        "S1 IDs are partitioned by country (never split) before any S1 ID reaches "
+        "model.group_folds -- no S1 ID appears in both the training GroupKFold OOF "
+        "and the held-out evaluation set, and no S1 ID appears in more than one "
+        "country partition."),
+}
+
+
+def _country_split(prep: dict, country: str) -> tuple[dict, dict]:
+    """Partition an already-``prepare``d (normalised, optionally embedded) dataset
+    into ``(train, held_out)`` by exact country match on the S1 and S2/S3 frames
+    independently -- ``held_out`` is every record (S1 and S2/S3 alike) whose country
+    equals ``country``.
+
+    Both sides' frames are reset to a fresh 0..n-1 index so embedding arrays (which
+    are positionally, not label, aligned with the original frames) can be sliced
+    with the same boolean mask used to select the frame rows. Never reads or touches
+    truth/labels -- country is a normalised covariate on S1/S2/S3 already, present
+    before any labels are consulted.
+    """
+    s1, others = prep["s1"], prep["others"]
+    ho_s1_mask = (s1[config.COUNTRY_COL] == country).to_numpy()
+    ho_o_mask = (others[config.COUNTRY_COL] == country).to_numpy()
+
+    def _slice(s1_mask: np.ndarray, o_mask: np.ndarray) -> dict:
+        emb = None
+        if prep["emb"] is not None:
+            emb = (np.asarray(prep["emb"][0])[s1_mask], np.asarray(prep["emb"][1])[o_mask])
+        return {"s1": s1[s1_mask].reset_index(drop=True),
+               "others": others[o_mask].reset_index(drop=True), "emb": emb}
+
+    return _slice(~ho_s1_mask, ~ho_o_mask), _slice(ho_s1_mask, ho_o_mask)
+
+
+def _loco_fold(prep: dict, truth: dict[str, list[str]], k_overrides: dict[str, int],
+              held_out_country: str) -> dict:
+    """One LOCO fold: train on every other country, evaluate on ``held_out_country``.
+
+    Candidate generation and ``features.FeatureContext`` fitting are both strictly
+    scoped to their own side of the split (see :data:`LOCO_LEAKAGE_CHECKS`); model
+    fitting, threshold tuning and per-fold stability use only the existing,
+    unmodified ``model``/``decide`` primitives run_pipeline.fit_and_tune itself
+    calls, inlined here (rather than calling ``fit_and_tune`` directly) only so this
+    function can also return the OOF frame/fold ids needed for
+    :func:`_fold_stability` -- the training math is identical either way. Decision
+    settings (one-to-one, decision order, tau/singleton_tau grid) are the untouched
+    production defaults from ``decide.py``/``config.py`` throughout, matching P3's
+    "keep one-to-one ON, keep existing decision order" conclusion.
+    """
+    tr, ho = _country_split(prep, held_out_country)
+    tr_ids = list(tr["s1"][config.ID_COL])
+    ho_ids = list(ho["s1"][config.ID_COL])
+    ho_country_map = dict(zip(ho_ids, ho["s1"][config.COUNTRY_COL]))
+
+    with diag.ResourceTracker() as rt:
+        cands_tr = generate_candidates(tr["s1"], tr["others"], embeddings=tr["emb"],
+                                       verbose=False, k_overrides=k_overrides)
+        cands_ho = generate_candidates(ho["s1"], ho["others"], embeddings=ho["emb"],
+                                       verbose=False, k_overrides=k_overrides)
+        block_stats = report_blocking_stats(cands_ho, truth, ho_ids, len(ho["others"]),
+                                            ho_country_map, verbose=False)
+
+        # The leakage fix: fit TF-IDF context on the training side only, reuse it
+        # (unmodified) for the held-out side -- see LOCO_LEAKAGE_CHECKS["feature_statistics_scope"].
+        ctx = FeatureContext.fit(tr["s1"], tr["others"])
+        feats_tr = build_features(cands_tr, tr["s1"], tr["others"], tr["emb"], ctx=ctx, verbose=False)
+        feats_tr["label"] = label_pairs(feats_tr, truth)
+        feats_ho = build_features(cands_ho, ho["s1"], ho["others"], ho["emb"], ctx=ctx, verbose=False)
+        feats_ho["label"] = label_pairs(feats_ho, truth)
+
+        cols = feature_columns(feats_tr)
+        X, y, groups = feats_tr[cols], feats_tr["label"].to_numpy(), feats_tr["s1_id"]
+        folds = group_folds(groups, config.N_FOLDS)
+        oof, fold_models = train_oof(X, y, groups, verbose=False)
+        oof_scored = feats_tr[["s1_id", "cand_id"]].assign(prob=oof)
+        tau, stau, oof_f05, _grid = tune_threshold(oof_scored, truth, tr_ids)
+        model = train_full(X, y, fold_models=fold_models)
+        stability = _fold_stability(oof_scored, folds, tau, stau, truth)
+
+        sc_ho = feats_ho[["s1_id", "cand_id"]].assign(prob=predict(model, feats_ho[cols]))
+        pred = apply_threshold(sc_ho, tau, ho_ids, stau)
+        report = score_report(pred, truth, ho_ids)
+
+    return {
+        "held_out_country": held_out_country,
+        "n_train_s1": len(tr_ids), "n_valid_s1": len(ho_ids),
+        "n_other_train": len(tr["others"]), "n_other_valid": len(ho["others"]),
+        "n_pairs": block_stats["n_pairs"],
+        "block_pair_recall": block_stats["pair_recall"],
+        "block_s1_full_recall": block_stats["s1_full_recall"],
+        "block_mean_candidates": block_stats["mean_candidates"],
+        "block_max_candidates": block_stats["max_candidates"],
+        "oof_macro_f05": oof_f05,
+        "macro_f05": report["macro_f05"],
+        "precision": report["pair_precision"], "recall": report["pair_recall"],
+        "singleton_f05": report["singleton_f05"], "non_singleton_f05": report["non_singleton_f05"],
+        "tau": tau, "singleton_tau": stau,
+        "fold_f05": ";".join(f"{v:.4f}" for v in stability["fold_f05"]),
+        "fold_f05_mean": stability["fold_f05_mean"], "fold_f05_std": stability["fold_f05_std"],
+        "runtime_seconds": rt.report["runtime_s"],
+        "peak_rss_bytes": rt.report["peak_rss_bytes"],
+        "current_rss_bytes": rt.report["current_rss_bytes"],
+    }
+
+
+def run_loco_comparison(sample: float = 0.0045, use_embeddings: bool = True) -> pd.DataFrame:
+    """LOCO country-generalization comparison: ``LOCO_CONFIGS``' "baseline" (20/20)
+    vs "both40" (40/40) candidate K, each evaluated identically (same normalisation,
+    embedding model, feature definitions, LightGBM hyperparameters, threshold/
+    singleton-threshold tuning mechanism, one-to-one ON, decision order, sample and
+    seed -- see :data:`LOCO_CONFIGS`'s docstring) across every country-held-out
+    direction actually present in the sampled training data.
+
+    France is never a training country (CLAUDE.md: train has only US/India, France
+    is test-only), so it can never appear as a LOCO direction here -- this is
+    verified against the loaded sample's own country set (not assumed) and recorded
+    explicitly in the JSON sidecar's ``limitations`` list, per the task's requirement
+    to document rather than fabricate a France result.
+
+    Writes ``artifacts/diagnostics/loco_comparison_<timestamp>.tsv`` (one row per
+    ``(configuration, held_out_country)``) and a sidecar
+    ``loco_comparison_<timestamp>.json`` (the exact configurations, directions,
+    skipped directions, limitations, :data:`LOCO_LEAKAGE_CHECKS`, git commit,
+    dataset hashes, env info and the full row detail). Returns the same frame. Never
+    touches ``output/``, never modifies ``config.py``/``run_pipeline.py``/
+    ``blocking.py``/``model.py``/``features.py``/``decide.py``/``evaluate.py``, and
+    never runs ``--mode test``.
+    """
+    _log(f"LOCO comparison: sample={sample}, configs={[c['name'] for c in LOCO_CONFIGS]}")
+    s1, s2, s3, truth = rp._load_train(sample)
+    prep = rp.prepare(s1, s2, s3, use_embeddings=use_embeddings, use_cache=True)
+    countries = sorted(set(prep["s1"][config.COUNTRY_COL]))
+    directions = [c for c in countries if (prep["s1"][config.COUNTRY_COL] != c).any()]
+    skipped = [c for c in countries if c not in directions]
+
+    limitations = [
+        f"Countries present in this sample's training data: {countries}. LOCO "
+        "directions were computed only for these -- France has no labeled training "
+        "records in the train split at all (CLAUDE.md: train is US/India only, "
+        "France is test-only), so it cannot be evaluated as a supervised LOCO "
+        "holdout (there is no remaining-country model to train it against, and no "
+        "France ground truth to score it with). No France LOCO result is reported "
+        "or implied by this experiment.",
+    ]
+    if skipped:
+        limitations.append(
+            f"Skipped as LOCO holdouts (no other training country remained to fit "
+            f"on): {skipped}.")
+
+    rows: list[dict] = []
+    for cfg in LOCO_CONFIGS:
+        k_overrides = {k: v for k, v in cfg.items() if k != "name"}
+        for c in directions:
+            row = _loco_fold(prep, truth, k_overrides, c)
+            row["configuration"] = cfg["name"]
+            row.update({f"k_{k}": v for k, v in k_overrides.items()})
+            row["sample"] = sample
+            rows.append(row)
+            _log(f"LOCO {cfg['name']} held-out={c}: macro F0.5={row['macro_f05']:.4f} "
+                f"(OOF={row['oof_macro_f05']:.4f}, "
+                f"block_pair_recall={row['block_pair_recall']:.4f})")
+
+    out = pd.DataFrame(rows)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    DIAG_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = DIAG_DIR / f"loco_comparison_{ts}.tsv"
+    out.to_csv(out_path, sep="\t", index=False)
+    meta = {
+        "kind": "loco_comparison", "timestamp": ts, "sample": sample,
+        "use_embeddings": use_embeddings,
+        "configs": LOCO_CONFIGS, "directions": directions, "skipped_directions": skipped,
+        "countries_in_sample": countries,
+        "limitations": limitations,
+        "leakage_checks": LOCO_LEAKAGE_CHECKS,
+        "git_commit": rp._git_hash(),
+        "dataset_file_hashes": diag.dataset_file_hashes(config.TRAIN_FILES),
+        "env": diag.env_info(),
+        "rows": rows,
+    }
+    diag.save_json(meta, DIAG_DIR / f"loco_comparison_{ts}.json")
+    _log(f"LOCO comparison: {len(rows)} rows written to {out_path}")
+    return out
+
+
 # --- CLI ---------------------------------------------------------------------------------
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1608,6 +1847,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     help="S1 sample fraction (default: 0.0045, the reproducible baseline scale)")
     dv.add_argument("--no-embeddings", action="store_true")
 
+    lc = sub.add_parser(
+        "loco",
+        help="LOCO country-generalization comparison: baseline (20/20) vs both40 "
+             "(40/40) candidate K, evaluated per country-held-out direction")
+    lc.add_argument("--sample", type=float, default=0.0045,
+                    help="S1 sample fraction (default: 0.0045, the reproducible baseline scale)")
+    lc.add_argument("--no-embeddings", action="store_true")
+
     return parser.parse_args(argv)
 
 
@@ -1634,6 +1881,8 @@ def main(argv: list[str] | None = None) -> None:
         run_fp16_retrieval(args.sample)
     elif args.command == "decision-validation":
         run_decision_validation(args.sample, not args.no_embeddings)
+    elif args.command == "loco":
+        run_loco_comparison(args.sample, not args.no_embeddings)
 
 
 if __name__ == "__main__":
