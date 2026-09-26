@@ -77,7 +77,9 @@ def test_run_stage_success_records_report_and_artifacts(tmp_path):
 
 
 def test_run_stage_failure_is_caught_and_reported(tmp_path):
-    """A raising stage never propagates; it's reported as success=False with the error."""
+    """A raising stage never propagates; it's reported as success=False with the error,
+    and the resource fields measured up to the failure point are kept (not nulled) --
+    a stage dying partway through is exactly when that information matters most."""
     def fn():
         raise ValueError("boom")
 
@@ -85,7 +87,16 @@ def test_run_stage_failure_is_caught_and_reported(tmp_path):
     assert report["success"] is False
     assert "boom" in report["error"]
     assert "ValueError" in report["traceback"]
-    assert report["runtime_s"] is None
+    assert report["runtime_s"] is not None and report["runtime_s"] >= 0
+    assert "peak_rss_bytes" in report  # int or None (best-effort), never dropped
+    assert "current_rss_bytes" in report
+
+
+def test_current_rss_bytes_never_raises():
+    """_current_rss_bytes is best-effort: None off Linux/on read failure, else a
+    non-negative int -- it must never raise."""
+    out = diag._current_rss_bytes()
+    assert out is None or (isinstance(out, int) and out >= 0)
 
 
 def test_save_json_round_trips(tmp_path):

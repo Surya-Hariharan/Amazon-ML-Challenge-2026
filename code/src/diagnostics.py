@@ -113,6 +113,26 @@ def _peak_rss_bytes() -> int | None:
     return ru_maxrss * 1024 if platform.system() == "Linux" else ru_maxrss
 
 
+def _current_rss_bytes() -> int | None:
+    """Best-effort *current* (not peak) resident-set size, in bytes.
+
+    Reads ``/proc/self/status``'s ``VmRSS:`` line -- Linux-only, stdlib-only.
+    Returns ``None`` off Linux or if the read fails for any reason. Unlike
+    ``_peak_rss_bytes`` (a process-lifetime high-water mark that can only grow
+    and is never reset), this is a snapshot at the moment it's called -- the
+    complementary signal to use when several stages/iterations are measured
+    within one process (see :class:`ResourceTracker`'s docstring).
+    """
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024  # reported in KiB
+    except Exception:
+        return None
+    return None
+
+
 def _peak_gpu_bytes() -> int | None:
     """Best-effort peak CUDA memory allocated since the last reset, in bytes."""
     try:
@@ -139,6 +159,29 @@ class ResourceTracker:
 
     ``self.report`` after ``__exit__`` holds ``runtime_s``, ``peak_rss_bytes``
     (``None`` off Linux) and ``peak_gpu_bytes`` (``None`` without CUDA).
+
+    IMPORTANT approximations, documented rather than hidden:
+
+    * ``peak_rss_bytes`` (``resource.getrusage().ru_maxrss``) is a
+      **process-lifetime** high-water mark. It cannot be reset mid-process,
+      so if this context manager is entered more than once within the same
+      process (e.g. a loop over several sizes/stages), a later entry's
+      ``peak_rss_bytes`` is contaminated by whatever any earlier entry
+      already pushed RSS to -- it is not isolated to that entry's own work.
+      ``current_rss_bytes`` (a genuine snapshot, not a running maximum) is
+      the signal to prefer when comparing several in-process measurements
+      against each other; ``peak_rss_bytes`` is only trustworthy as an
+      isolated measurement when this context manager is the first and only
+      one entered in a fresh process (e.g. one ``resource-stage`` CLI
+      invocation per stage).
+    * ``peak_gpu_bytes`` genuinely *is* reset per entry
+      (``torch.cuda.reset_peak_memory_stats()`` is a real reset, unlike host
+      RSS), so it does not share this limitation.
+    * ``runtime_s`` assumes the wrapped code synchronises the GPU itself
+      before returning (e.g. via ``.cpu()``/``.numpy()``, as every GPU call
+      in this codebase already does) -- CUDA ops are otherwise asynchronous,
+      and a future GPU function that returns without forcing a sync could
+      make elapsed time under-reported.
     """
 
     def __init__(self) -> None:
@@ -153,9 +196,10 @@ class ResourceTracker:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        """Record runtime and best-effort peak RSS/GPU memory."""
+        """Record runtime and best-effort peak/current RSS + peak GPU memory."""
         self.report["runtime_s"] = time.time() - self._t0
         self.report["peak_rss_bytes"] = _peak_rss_bytes()
+        self.report["current_rss_bytes"] = _current_rss_bytes()
         self.report["peak_gpu_bytes"] = _peak_gpu_bytes()
 
 
@@ -174,26 +218,33 @@ def run_stage(
     function, decides whether to stop and move on).
 
     Returns a JSON-serialisable dict with ``name``, ``success``, ``start``,
-    ``end``, ``runtime_s``, ``peak_rss_bytes``, ``peak_gpu_bytes``,
-    ``disk_before``, ``disk_after``, ``artifact_sizes``, and, on failure,
-    ``error`` and ``traceback``. If ``log_dir`` is given, the report is also
-    written to ``<log_dir>/stage_<name>_<timestamp>.json``.
+    ``end``, ``runtime_s``, ``peak_rss_bytes``, ``current_rss_bytes``,
+    ``peak_gpu_bytes``, ``disk_before``, ``disk_after``, ``artifact_sizes``,
+    and, on failure, ``error`` and ``traceback``. On failure the resource
+    fields are still populated with whatever was measured up to the point of
+    failure (not nulled out) -- a stage dying partway through is exactly the
+    case where knowing how far it got before dying matters most. If
+    ``log_dir`` is given, the report is also written to
+    ``<log_dir>/stage_<name>_<timestamp>.json``.
     """
     disk_before = disk_usage(Path.cwd())
     start = time.strftime("%Y-%m-%d %H:%M:%S")
     report: dict[str, Any] = {"name": name, "start": start}
+    rt = ResourceTracker()
     try:
-        with ResourceTracker() as rt:
+        with rt:
             fn()
         report.update(rt.report)
         report["success"] = True
     except Exception as exc:  # noqa: BLE001 -- must never crash the qualification driver
+        # A failing stage is exactly the case where knowing how far it got
+        # before dying matters most (e.g. diagnosing a real OOM) -- record
+        # whatever ResourceTracker's __exit__ already captured (it still ran,
+        # since it's a context manager) rather than discarding it to None.
         report["success"] = False
         report["error"] = str(exc)
         report["traceback"] = traceback.format_exc()
-        report["runtime_s"] = None
-        report["peak_rss_bytes"] = None
-        report["peak_gpu_bytes"] = None
+        report.update(rt.report)
     report["end"] = time.strftime("%Y-%m-%d %H:%M:%S")
     report["disk_before"] = disk_before
     report["disk_after"] = disk_usage(Path.cwd())
