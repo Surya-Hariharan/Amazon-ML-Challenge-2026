@@ -21,6 +21,7 @@ Usage (from code/business_entity_resolution/)::
     python -m src.diagnose blocking-k-downstream [--sample 0.0045] [--no-embeddings]
     python -m src.diagnose chunk-equality [--sample 0.0045]
     python -m src.diagnose fp16-retrieval [--sample 0.0045]
+    python -m src.diagnose decision-validation [--sample 0.0045] [--no-embeddings]
 
 Every subcommand is measurement-only: none of them changes ``output/``, and
 none of them is wired to run automatically -- each is a separate, explicit CLI
@@ -43,7 +44,7 @@ from . import drift as drift_mod
 from . import error_decomposition as edecomp
 from . import run_pipeline as rp
 from .blocking import country_groups, dense_topk, generate_candidates, report_blocking_stats
-from .decide import apply_threshold, tune_threshold
+from .decide import apply_threshold, assign_one_to_one, tune_threshold
 from .evaluate import blocking_recall, score_report
 from .features import build_features, feature_columns, label_pairs
 from .io_utils import load_source, load_split
@@ -559,7 +560,9 @@ def _fit_and_tune_with_oof(feats: pd.DataFrame, truth: dict[str, list[str]],
 
 
 def _fold_stability(scored: pd.DataFrame, folds: np.ndarray, tau: float,
-                    singleton_tau: float | None, truth: dict[str, list[str]]) -> dict:
+                    singleton_tau: float | None, truth: dict[str, list[str]],
+                    one_to_one: bool = config.ONE_TO_ONE,
+                    decide_fn: Callable[..., dict] | None = None) -> dict:
     """Per-fold macro F0.5 from OOF predictions, using the one tuned threshold pair.
 
     Each GroupKFold fold holds a disjoint set of S1 groups (``model.group_folds``'
@@ -569,6 +572,15 @@ def _fold_stability(scored: pd.DataFrame, folds: np.ndarray, tau: float,
     sweep is reused for every fold (task requirement 10: no per-fold threshold
     re-tuning), so this measures how stable the *chosen* operating point is across
     folds, not how well each fold could have done with its own threshold.
+
+    ``one_to_one`` (used only when ``decide_fn`` is not given) and ``decide_fn`` let
+    P3 reuse this exact per-fold-stability computation for one-to-one ON/OFF
+    (:func:`decide.apply_threshold` with the requested flag) and for the P3-B
+    decision-order comparison (an arbitrary ``(scored, tau, s1_ids, singleton_tau)
+    -> pred`` callable, e.g. :func:`decide_threshold_then_one_to_one`) without
+    duplicating the fold-slicing loop. Existing callers that pass neither argument
+    get exactly the prior behaviour (production ``apply_threshold`` with
+    ``one_to_one=True``).
     """
     s1_col = scored["s1_id"].to_numpy()
     per_fold: list[float] = []
@@ -577,7 +589,10 @@ def _fold_stability(scored: pd.DataFrame, folds: np.ndarray, tau: float,
         fold_s1 = sorted(set(s1_col[mask]))
         if not fold_s1:
             continue
-        pred = apply_threshold(scored[mask], tau, fold_s1, singleton_tau)
+        if decide_fn is not None:
+            pred = decide_fn(scored[mask], tau, fold_s1, singleton_tau)
+        else:
+            pred = apply_threshold(scored[mask], tau, fold_s1, singleton_tau, one_to_one=one_to_one)
         per_fold.append(score_report(pred, truth, fold_s1)["macro_f05"])
     arr = np.array(per_fold, dtype=float)
     return {
@@ -1162,6 +1177,371 @@ def run_fp16_retrieval(sample: float = 0.0045, encoder: Encoder | None = None) -
     return report
 
 
+# --- P3: decision-layer validation ---------------------------------------------------------
+
+#: Candidate configuration held fixed for the whole P3 experiment: the "both40"
+#: configuration P1-downstream reported as the current best candidate (task
+#: requirement -- P3 does not compare blocking-K values, it isolates the decision
+#: layer). ``rare``/``digit``/``address`` stay at their P1-downstream values too.
+P3_CANDIDATE_CONFIG: dict[str, int] = {"tfidf": 40, "embed": 40, "rare": 10, "digit": 10,
+                                       "address": 10}
+
+
+def decide_threshold_then_one_to_one(
+    scored: pd.DataFrame, tau: float, s1_ids: Iterable[str] | None,
+    singleton_tau: float | None = None,
+) -> dict[str, list[str]]:
+    """Diagnostic-only decision order: threshold (+ singleton gate) first, one-to-one
+    assignment second -- the reverse of production's order.
+
+    ``decide.apply_threshold`` (unmodified, called elsewhere in this module as-is)
+    always applies :func:`decide.assign_one_to_one` *before* the ``prob >= tau``
+    filter, i.e. one-to-one-then-threshold; that is P3-B's "Order B". This function
+    exists solely so P3-B can measure the other ordering ("Order A": threshold first,
+    one-to-one only among the pairs that already passed the threshold/singleton gate)
+    without changing ``decide.py`` itself. It calls the exact same primitives
+    (``assign_one_to_one``) production uses, in a different sequence.
+    """
+    keep = scored["prob"].to_numpy() >= tau
+    if singleton_tau is not None:
+        top = scored.groupby("s1_id")["prob"].transform("max").to_numpy()
+        keep &= top >= singleton_tau
+    final = assign_one_to_one(scored[keep])
+    kept = final.sort_values(["s1_id", "prob", "cand_id"], ascending=[True, False, True])
+    out = {s: list(g) for s, g in kept.groupby("s1_id", sort=False)["cand_id"]}
+    universe = scored["s1_id"].unique() if s1_ids is None else s1_ids
+    return {s: out.get(s, []) for s in universe}
+
+
+#: The two decision orders P3-B compares, as ``(scored, tau, s1_ids, singleton_tau)
+#: -> {s1_id: [matched ids]}`` callables sharing one signature so P3-B's loop can
+#: treat them identically. "order_b" is production's own ``apply_threshold``,
+#: unmodified, called with ``one_to_one=True`` -- not a re-implementation.
+_DECISION_ORDERS: dict[str, Callable[..., dict]] = {
+    "order_A_threshold_then_one_to_one": decide_threshold_then_one_to_one,
+    "order_B_one_to_one_then_threshold": lambda scored, tau, s1_ids, singleton_tau: apply_threshold(
+        scored, tau, s1_ids, singleton_tau, one_to_one=True),
+}
+
+
+def _label_lookup(scored: pd.DataFrame) -> dict[tuple[str, str], int]:
+    """``{(s1_id, cand_id): label}`` for a scored frame that carries a ``label`` column."""
+    return {(s, c): int(l) for s, c, l in
+           zip(scored["s1_id"], scored["cand_id"], scored["label"])}
+
+
+def _removal_counts(pre: dict[str, list[str]], post: dict[str, list[str]],
+                    label_lookup: dict[tuple[str, str], int]) -> dict:
+    """Pairs kept by ``pre`` but dropped by ``post`` -- i.e. what going from ``pre``
+    to ``post`` removed, split into true (label 1) and false (label 0) matches.
+
+    Used by P3-A (``pre`` = threshold-only/one-to-one-off, ``post`` = one-to-one-on,
+    at the same tau) and P3-B (``pre`` = threshold-only, ``post`` = one order's
+    final decision) to answer "how many matches, and how many of them true, did
+    one-to-one remove".
+    """
+    pre_pairs = {(s, c) for s, cs in pre.items() for c in cs}
+    post_pairs = {(s, c) for s, cs in post.items() for c in cs}
+    removed = pre_pairs - post_pairs
+    n_true_removed = sum(1 for p in removed if label_lookup.get(p, 0) == 1)
+    return {
+        "n_predicted_pre": len(pre_pairs), "n_predicted_post": len(post_pairs),
+        "n_removed_by_step": len(removed), "n_true_matches_removed": n_true_removed,
+        "n_false_matches_removed": len(removed) - n_true_removed,
+    }
+
+
+def _tau_neighborhood(tau: float, grid: tuple[float, ...] = config.TAU_GRID,
+                      step: float = 0.025, n: int = 2) -> list[float]:
+    """5-point neighborhood ``T-2*step .. T+2*step`` around ``tau``, clipped to the
+    existing ``config.TAU_GRID``'s own min/max so every returned value is one
+    ``tune_threshold`` could actually have chosen (task requirement: "appropriate to
+    the existing threshold grid", "only evaluate thresholds that are valid").
+    """
+    lo, hi = min(grid), max(grid)
+    cand = (round(tau + i * step, 3) for i in range(-n, n + 1))
+    return sorted({c for c in cand if lo <= c <= hi})
+
+
+def _singleton_neighborhood(singleton_tau: float | None,
+                            grid: tuple[float, ...] = config.TAU_GRID,
+                            step: float = 0.025, n: int = 2) -> list[float | None]:
+    """Neighborhood around the selected singleton threshold, reusing
+    :func:`_tau_neighborhood`'s clipping. ``None`` (no singleton gate) has no numeric
+    neighborhood, so it is returned as its own single-element list -- this never
+    invents a new thresholding scheme for the "no gate" case (task requirement).
+    """
+    if singleton_tau is None:
+        return [None]
+    return _tau_neighborhood(singleton_tau, grid, step, n)
+
+
+def _p3_prepare(sample: float, use_embeddings: bool) -> dict:
+    """P3 shared setup: load, normalise/embed, block (fixed ``P3_CANDIDATE_CONFIG``)
+    and featurise the sample exactly once, plus one train/valid S1 split.
+
+    Every P3 sub-experiment (A/B/C/D) reuses this same ``cands``/``feats``/split --
+    only the decision-layer variable may differ between them (task's "experiment
+    isolation" requirement). Calls the existing, unmodified ``run_pipeline.prepare``,
+    ``blocking.generate_candidates``, ``blocking.report_blocking_stats``,
+    ``features.build_features``, ``features.label_pairs`` and ``run_pipeline.split_s1``
+    -- the same functions ``run_pipeline.valid_run`` uses, in the same order.
+    """
+    s1, s2, s3, truth = rp._load_train(sample)
+    prep = rp.prepare(s1, s2, s3, use_embeddings=use_embeddings, use_cache=True)
+    s1_ids = list(prep["s1"][config.ID_COL])
+    s1_country = dict(zip(prep["s1"][config.ID_COL], prep["s1"][config.COUNTRY_COL]))
+    n_other = len(prep["others"])
+    cands = generate_candidates(prep["s1"], prep["others"], embeddings=prep["emb"],
+                                verbose=False, k_overrides=dict(P3_CANDIDATE_CONFIG))
+    block_stats = report_blocking_stats(cands, truth, s1_ids, n_other, s1_country, verbose=False)
+    feats = build_features(cands, prep["s1"], prep["others"], prep["emb"])
+    feats["label"] = label_pairs(feats, truth)
+    train_ids, valid_ids = rp.split_s1(s1_ids, truth)
+    return {
+        "prep": prep, "cands": cands, "feats": feats, "truth": truth,
+        "train_ids": train_ids, "valid_ids": valid_ids, "s1_country": s1_country,
+        "block_stats": block_stats, "s1_ids": s1_ids, "n_other": n_other,
+    }
+
+
+def _p3_train(ctx: dict) -> dict:
+    """Train the ONE LightGBM model/OOF the whole P3 experiment reuses.
+
+    Exactly one ``model.group_folds`` + ``model.train_oof`` + ``model.train_full``
+    call happens here, on ``ctx``'s training S1s -- no P3 sub-experiment (A/B/C/D)
+    retrains anything (task's explicit "do NOT retrain" requirement for P3-B/C, and
+    the shared-model requirement for P3-A). Returns the OOF-scored training pairs
+    (with ``label``, for removal-count bookkeeping), the GroupKFold fold id per
+    training row (for fold-stability), the trained full model, and that model's
+    scored predictions on the held-out validation pairs.
+    """
+    feats = ctx["feats"]
+    in_train = feats["s1_id"].isin(set(ctx["train_ids"])).to_numpy()
+    feats_train = feats[in_train]
+    cols = feature_columns(feats)
+    X, y, groups = feats_train[cols], feats_train["label"].to_numpy(), feats_train["s1_id"]
+    folds = group_folds(groups, config.N_FOLDS)
+    oof, fold_models = train_oof(X, y, groups, verbose=False)
+    oof_scored = feats_train[["s1_id", "cand_id", "label"]].assign(prob=oof)
+    model = train_full(X, y, fold_models=fold_models)
+    valid_feats = feats[~in_train]
+    valid_scored = valid_feats[["s1_id", "cand_id", "label"]].assign(
+        prob=predict(model, valid_feats[feature_columns(feats)]))
+    return {"model": model, "oof_scored": oof_scored, "folds": folds, "valid_scored": valid_scored}
+
+
+def run_p3a_one_to_one(ctx: dict, trained: dict, truth: dict[str, list[str]]) -> dict:
+    """P3-A: one-to-one ON vs OFF, threshold retuned (via the existing
+    ``decide.tune_threshold`` mechanism) separately for each, on the one shared OOF.
+
+    For each of ``one_to_one in (True, False)``: tunes ``(tau, singleton_tau)`` on
+    the training OOF with that flag (``decide.tune_threshold``'s own sweep already
+    applies one-to-one internally when asked, so this is production's exact tuning
+    mechanism, not a new one), applies the matching flag to the held-out validation
+    predictions (``decide.apply_threshold``, unmodified), and reports OOF/validation
+    macro F0.5, precision/recall, singleton/non-singleton and per-country F0.5,
+    predicted/true match counts, per-fold OOF stability, and -- for the ON row --
+    how many matches (and how many of them true) one-to-one removed relative to the
+    same tau/singleton_tau with one-to-one off.
+
+    Returns ``{"rows": [...], "tuned": {True: {...}, False: {...}}}``; P3-B/C/D reuse
+    ``tuned[True]``'s ``(tau, singleton_tau)`` as "the current production tuning".
+    """
+    train_ids, valid_ids = ctx["train_ids"], ctx["valid_ids"]
+    s1_country = ctx["s1_country"]
+    oof_scored, valid_scored = trained["oof_scored"], trained["valid_scored"]
+    label_lookup_valid = _label_lookup(valid_scored)
+    rows: list[dict] = []
+    tuned: dict[bool, dict] = {}
+    for one_to_one in (True, False):
+        tau, stau, oof_f05, _grid = tune_threshold(oof_scored, truth, train_ids,
+                                                    one_to_one=one_to_one)
+        tuned[one_to_one] = {"tau": tau, "singleton_tau": stau}
+        pred = apply_threshold(valid_scored, tau, valid_ids, stau, one_to_one=one_to_one)
+        report = score_report(pred, truth, valid_ids, groups=s1_country)
+        stability = _fold_stability(oof_scored, trained["folds"], tau, stau, truth,
+                                    one_to_one=one_to_one)
+        n_pred = sum(len(v) for v in pred.values())
+        n_true = sum(len(set(truth.get(s, ()))) for s in valid_ids)
+        if one_to_one:
+            pred_off = apply_threshold(valid_scored, tau, valid_ids, stau, one_to_one=False)
+            removal = _removal_counts(pred_off, pred, label_lookup_valid)
+        else:
+            removal = {"n_predicted_pre": n_pred, "n_predicted_post": n_pred,
+                      "n_removed_by_step": 0, "n_true_matches_removed": 0,
+                      "n_false_matches_removed": 0}
+        rows.append({
+            "experiment": f"P3A_one_to_one_{'on' if one_to_one else 'off'}",
+            "one_to_one": one_to_one, "tau": tau, "singleton_tau": stau,
+            "oof_macro_f05": oof_f05,
+            **{f"valid_{k}": v for k, v in report.items()},
+            "n_predicted_matches": n_pred, "n_true_matches": n_true,
+            **removal,
+            "fold_f05": ";".join(f"{v:.4f}" for v in stability["fold_f05"]),
+            "fold_f05_mean": stability["fold_f05_mean"],
+            "fold_f05_std": stability["fold_f05_std"],
+        })
+        _log(f"P3-A one_to_one={one_to_one}: OOF F0.5={oof_f05:.4f} "
+            f"valid F0.5={report['macro_f05']:.4f} tau={tau} singleton_tau={stau}")
+    return {"rows": rows, "tuned": tuned}
+
+
+def run_p3b_decision_order(ctx: dict, trained: dict, truth: dict[str, list[str]],
+                           tau: float, singleton_tau: float | None) -> list[dict]:
+    """P3-B: decision order (threshold-then-one-to-one vs one-to-one-then-threshold),
+    at the ONE ``(tau, singleton_tau)`` P3-A's one-to-one-ON tuning selected -- the
+    model is not retrained and the threshold is not retuned between orders, so only
+    ordering can explain a difference (task requirement).
+    """
+    train_ids, valid_ids = ctx["train_ids"], ctx["valid_ids"]
+    s1_country = ctx["s1_country"]
+    oof_scored, valid_scored = trained["oof_scored"], trained["valid_scored"]
+    label_lookup_valid = _label_lookup(valid_scored)
+    pred_threshold_only = apply_threshold(valid_scored, tau, valid_ids, singleton_tau,
+                                          one_to_one=False)
+    rows: list[dict] = []
+    for name, decide_fn in _DECISION_ORDERS.items():
+        oof_pred = decide_fn(oof_scored, tau, train_ids, singleton_tau)
+        valid_pred = decide_fn(valid_scored, tau, valid_ids, singleton_tau)
+        oof_f05 = score_report(oof_pred, truth, train_ids)["macro_f05"]
+        report = score_report(valid_pred, truth, valid_ids, groups=s1_country)
+        stability = _fold_stability(oof_scored, trained["folds"], tau, singleton_tau, truth,
+                                    decide_fn=decide_fn)
+        removal = _removal_counts(pred_threshold_only, valid_pred, label_lookup_valid)
+        rows.append({
+            "experiment": f"P3B_{name}", "decision_order": name,
+            "tau": tau, "singleton_tau": singleton_tau,
+            "oof_macro_f05": oof_f05,
+            **{f"valid_{k}": v for k, v in report.items()},
+            "n_predicted_matches": sum(len(v) for v in valid_pred.values()),
+            "n_true_matches": sum(len(set(truth.get(s, ()))) for s in valid_ids),
+            **removal,
+            "fold_f05": ";".join(f"{v:.4f}" for v in stability["fold_f05"]),
+            "fold_f05_mean": stability["fold_f05_mean"],
+            "fold_f05_std": stability["fold_f05_std"],
+        })
+        _log(f"P3-B {name}: OOF F0.5={oof_f05:.4f} valid F0.5={report['macro_f05']:.4f}")
+    return rows
+
+
+def run_p3c_threshold_generalization(ctx: dict, trained: dict, truth: dict[str, list[str]],
+                                     tau: float, singleton_tau: float | None) -> list[dict]:
+    """P3-C: score the tuned ``tau``'s neighborhood (task's example spacing, clipped
+    to ``config.TAU_GRID``) on the held-out validation predictions, at the SAME
+    ``singleton_tau`` and the SAME (already-trained) model/OOF -- no retuning, no new
+    thresholding method, per task requirement.
+    """
+    valid_ids = ctx["valid_ids"]
+    s1_country = ctx["s1_country"]
+    valid_scored = trained["valid_scored"]
+    rows: list[dict] = []
+    for t in _tau_neighborhood(tau):
+        pred = apply_threshold(valid_scored, t, valid_ids, singleton_tau, one_to_one=config.ONE_TO_ONE)
+        report = score_report(pred, truth, valid_ids, groups=s1_country)
+        rows.append({
+            "experiment": f"P3C_tau_{t:.3f}", "tau": t,
+            "delta_from_selected_tau": round(t - tau, 3),
+            "singleton_tau": singleton_tau, "is_selected": t == tau,
+            **{f"valid_{k}": v for k, v in report.items()},
+        })
+        _log(f"P3-C tau={t}: valid F0.5={report['macro_f05']:.4f}")
+    return rows
+
+
+def run_p3d_singleton_threshold(ctx: dict, trained: dict, truth: dict[str, list[str]],
+                                tau: float, singleton_tau: float | None) -> list[dict]:
+    """P3-D: singleton-threshold behaviour at the selected value plus its neighborhood
+    (task's example spacing; ``None`` gets no numeric neighborhood -- see
+    :func:`_singleton_neighborhood`), at the SAME ``tau`` and the SAME model/OOF.
+
+    Each row additionally reports predicted-singleton (zero-match), true-singleton
+    and false-singleton (predicted empty despite real matches existing) counts.
+    """
+    valid_ids = ctx["valid_ids"]
+    s1_country = ctx["s1_country"]
+    valid_scored = trained["valid_scored"]
+    truth_by_s1 = {s: set(truth.get(s, ())) for s in valid_ids}
+    n_true_singletons = sum(1 for s in valid_ids if not truth_by_s1[s])
+    rows: list[dict] = []
+    for stau in _singleton_neighborhood(singleton_tau):
+        pred = apply_threshold(valid_scored, tau, valid_ids, stau, one_to_one=config.ONE_TO_ONE)
+        report = score_report(pred, truth, valid_ids, groups=s1_country)
+        n_pred_singletons = sum(1 for s in valid_ids if not pred.get(s))
+        n_false_singletons = sum(1 for s in valid_ids if not pred.get(s) and truth_by_s1[s])
+        label = "none" if stau is None else f"{stau:.3f}"
+        rows.append({
+            "experiment": f"P3D_singleton_tau_{label}", "tau": tau, "singleton_tau": stau,
+            "is_selected": stau == singleton_tau,
+            "n_predicted_singletons": n_pred_singletons, "zero_match_count": n_pred_singletons,
+            "n_true_singletons": n_true_singletons, "n_false_singletons": n_false_singletons,
+            **{f"valid_{k}": v for k, v in report.items()},
+        })
+        _log(f"P3-D singleton_tau={stau}: valid F0.5={report['macro_f05']:.4f} "
+            f"n_false_singletons={n_false_singletons}")
+    return rows
+
+
+def run_decision_validation(sample: float = 0.0045, use_embeddings: bool = True) -> pd.DataFrame:
+    """P3: decision-layer validation on ONE fixed candidate configuration
+    (``P3_CANDIDATE_CONFIG``, the current "both40" candidate) and ONE trained
+    LightGBM model/OOF -- P3-A (one-to-one ON/OFF), P3-B (decision order), P3-C
+    (threshold neighborhood) and P3-D (singleton-threshold neighborhood) each vary
+    only their own decision-layer knob, per the task's experiment-isolation
+    requirement. Never retrains between sub-experiments, never touches ``output/``,
+    ``run_pipeline.py`` or any ``config.py`` default, and never runs ``--mode test``.
+
+    Writes one row per configuration (18 total: 2 for P3-A, 2 for P3-B, up to 5 for
+    P3-C, up to 5 for P3-D) to
+    ``artifacts/diagnostics/decision_validation_<timestamp>.tsv`` and a sidecar
+    ``decision_validation_<timestamp>.json`` (full per-experiment detail, the
+    candidate configuration, the selected tau/singleton_tau, block stats, git commit,
+    dataset hashes and env info). Returns the same frame.
+    """
+    _log(f"P3 decision validation: sample={sample}, candidate config={P3_CANDIDATE_CONFIG}")
+    with diag.ResourceTracker() as rt:
+        ctx = _p3_prepare(sample, use_embeddings)
+        trained = _p3_train(ctx)
+        truth = ctx["truth"]
+
+        a = run_p3a_one_to_one(ctx, trained, truth)
+        tau, singleton_tau = a["tuned"][True]["tau"], a["tuned"][True]["singleton_tau"]
+
+        b_rows = run_p3b_decision_order(ctx, trained, truth, tau, singleton_tau)
+        c_rows = run_p3c_threshold_generalization(ctx, trained, truth, tau, singleton_tau)
+        d_rows = run_p3d_singleton_threshold(ctx, trained, truth, tau, singleton_tau)
+
+    all_rows = a["rows"] + b_rows + c_rows + d_rows
+    for row in all_rows:
+        row.setdefault("candidate_config", str(P3_CANDIDATE_CONFIG))
+        row.setdefault("sample", sample)
+    out = pd.DataFrame(all_rows)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    DIAG_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = DIAG_DIR / f"decision_validation_{ts}.tsv"
+    out.to_csv(out_path, sep="\t", index=False)
+    meta = {
+        "kind": "decision_validation", "timestamp": ts, "sample": sample,
+        "use_embeddings": use_embeddings, "candidate_config": P3_CANDIDATE_CONFIG,
+        "n_s1": len(ctx["s1_ids"]), "n_train_s1": len(ctx["train_ids"]),
+        "n_valid_s1": len(ctx["valid_ids"]), "n_other": ctx["n_other"],
+        "selected_tau": tau, "selected_singleton_tau": singleton_tau,
+        "block_stats": ctx["block_stats"],
+        "p3a_one_to_one": a["rows"], "p3b_decision_order": b_rows,
+        "p3c_threshold_generalization": c_rows, "p3d_singleton_threshold": d_rows,
+        "git_commit": rp._git_hash(),
+        "dataset_file_hashes": diag.dataset_file_hashes(config.TRAIN_FILES),
+        "env": diag.env_info(),
+        "runtime_seconds": rt.report["runtime_s"],
+        "peak_rss_bytes": rt.report["peak_rss_bytes"],
+        "current_rss_bytes": rt.report["current_rss_bytes"],
+    }
+    diag.save_json(meta, DIAG_DIR / f"decision_validation_{ts}.json")
+    _log(f"P3 decision validation: {len(all_rows)} rows written to {out_path} "
+        f"(selected tau={tau}, singleton_tau={singleton_tau})")
+    return out
+
+
 # --- CLI ---------------------------------------------------------------------------------
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1220,6 +1600,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     fp.add_argument("--sample", type=float, default=0.0045,
                     help="S1 sample fraction (default: 0.0045, the reproducible baseline scale)")
 
+    dv = sub.add_parser(
+        "decision-validation",
+        help="P3: decision-layer validation (one-to-one ON/OFF, decision order, "
+             "threshold and singleton-threshold neighborhoods)")
+    dv.add_argument("--sample", type=float, default=0.0045,
+                    help="S1 sample fraction (default: 0.0045, the reproducible baseline scale)")
+    dv.add_argument("--no-embeddings", action="store_true")
+
     return parser.parse_args(argv)
 
 
@@ -1244,6 +1632,8 @@ def main(argv: list[str] | None = None) -> None:
         run_chunk_equality(args.sample)
     elif args.command == "fp16-retrieval":
         run_fp16_retrieval(args.sample)
+    elif args.command == "decision-validation":
+        run_decision_validation(args.sample, not args.no_embeddings)
 
 
 if __name__ == "__main__":
