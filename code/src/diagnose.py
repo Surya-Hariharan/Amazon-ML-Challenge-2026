@@ -23,6 +23,7 @@ Usage (from code/business_entity_resolution/)::
     python -m src.diagnose fp16-retrieval [--sample 0.0045]
     python -m src.diagnose decision-validation [--sample 0.0045] [--no-embeddings]
     python -m src.diagnose loco [--sample 0.0045] [--no-embeddings]
+    python -m src.diagnose feature-hard-negative [--sample 0.0045] [--no-embeddings]
 
 Every subcommand is measurement-only: none of them changes ``output/``, and
 none of them is wired to run automatically -- each is a separate, explicit CLI
@@ -49,7 +50,7 @@ from .decide import apply_threshold, assign_one_to_one, tune_threshold
 from .evaluate import blocking_recall, score_report
 from .features import FeatureContext, build_features, feature_columns, label_pairs
 from .io_utils import load_source, load_split
-from .model import group_folds, predict, train_full, train_oof
+from .model import feature_importance, group_folds, predict, train_full, train_oof
 
 Encoder = Callable[[list[str]], np.ndarray]
 
@@ -1781,6 +1782,456 @@ def run_loco_comparison(sample: float = 0.0045, use_embeddings: bool = True) -> 
     return out
 
 
+# --- Final pre-lock diagnostic: feature audit + hard-negative overlap ----------------------
+
+#: One-line, hand-authored meaning for every feature ``features.build_features`` can
+#: produce, keyed by exact column name. Read once against ``features.py`` (see that
+#: module's ``pair_features``/``blocking_features``/``context_features``) rather than
+#: derived at runtime, so the audit describes what the code *means* to compute, not
+#: just its numeric shape. A feature absent from this dict (e.g. after a future
+#: features.py change) is still audited below, flagged as unannotated rather than
+#: silently skipped or crashing.
+FEATURE_MEANINGS: dict[str, str] = {
+    "name_jw": "Jaro-Winkler similarity of name_core (prefix-weighted edit distance).",
+    "name_ratio": "rapidfuzz simple ratio of name_core (overall edit-distance similarity).",
+    "name_token_set": "Token-set ratio of name_core (robust to token reordering/duplication).",
+    "name_token_sort": "Token-sort ratio of name_core (robust to token reordering only).",
+    "name_partial": "Partial (substring) ratio of name_core.",
+    "name_full_token_set": "Token-set ratio of the fuller name_norm (suffix/alias retained).",
+    "name_compact_ratio": "Ratio of name_compact (whitespace/punctuation-stripped name).",
+    "name_compact_partial": "Partial ratio of name_compact.",
+    "name_tfidf_cos": "Char 3-4-gram TF-IDF cosine of name_core (vocabulary-weighted).",
+    "name_core_exact": "1.0 iff name_core strings are byte-identical, else 0.0.",
+    "name_compact_exact": "1.0 iff name_compact strings are byte-identical, else 0.0.",
+    "suffix_equal": "1.0 iff the raw legal-suffix token is identical (0.0 if both present but differ, NaN handled via suffix_one_missing).",
+    "suffix_both": "1.0 iff both sides carry a recognised legal-suffix family.",
+    "suffix_conflict": "1.0 iff both sides have a suffix family and they disagree (e.g. LLC vs Inc).",
+    "suffix_one_missing": "1.0 iff exactly one side has a legal suffix and the other has none.",
+    "acronym_match": "1.0 iff one side's acronym equals the other side's compact name (either direction).",
+    "name_token_jaccard": "Jaccard overlap of name_core's whitespace tokens (0.0, not NaN, when either side is empty).",
+    "name_len_ratio": "min(len)/max(len) of name_core -- a length-symmetry proxy.",
+    "first_token_equal": "1.0/0.0/NaN: whether the first name token matches (NaN if either side has none).",
+    "cand_is_website": "1.0 iff the candidate's business_name was flagged as a bare URL/website string.",
+    "cand_has_dba": "1.0 iff the candidate carries a parsed 'doing business as' alias.",
+    "addr_empty_s1": "1.0 iff the S1 record's normalised address is empty.",
+    "addr_empty_cand": "1.0 iff the candidate's normalised address is empty.",
+    "addr_ratio": "rapidfuzz ratio of addr_norm; NaN if either side's address is empty.",
+    "addr_token_set": "Token-set ratio of addr_norm; NaN if either side's address is empty.",
+    "addr_token_sort": "Token-sort ratio of addr_norm; NaN if either side's address is empty.",
+    "addr_partial": "Partial ratio of addr_norm; NaN if either side's address is empty.",
+    "addr_tfidf_cos": "Char 3-4-gram TF-IDF cosine of addr_norm; NaN if either side is empty.",
+    "addr_token_jaccard": "Jaccard overlap of addr_norm's tokens; NaN if either side has none.",
+    "digit_jaccard": "Jaccard overlap of extracted digit tokens (house/PIN/ZIP numbers); NaN if either side has none.",
+    "digit_shared": "Count of digit tokens shared between the two addresses.",
+    "digit_conflict": "1.0 iff both sides have digit tokens and share none (NaN if either side has no digits at all).",
+    "digit_cand_subset": "1.0 iff the candidate's digit tokens are a subset of the S1's (NaN if either side has no digits).",
+    "house_equal": "1.0/0.0/NaN: whether the parsed house number matches.",
+    "long_num_equal": "1.0 iff any long numeric token (e.g. a full PIN/ZIP) is shared; NaN if either side has none.",
+    "landmark_jaccard": "Jaccard overlap of parsed landmark-phrase tokens ('near X', 'opp Y').",
+    "region_equal": "1.0/0.0/NaN: whether a parsed region/state token matches.",
+    "same_country": "1.0 iff the two records' raw country strings are identical (the only country-derived feature; CLAUDE.md §2.4).",
+    "emb_cos": "Cosine similarity of the multilingual sentence-embedding vectors (name+address); NaN if embeddings were not computed.",
+    "in_tfidf": "1.0 iff this pair was produced by the TF-IDF name-cosine blocking pass.",
+    "in_embed": "1.0 iff this pair was produced by the dense-embedding blocking pass.",
+    "in_rare": "1.0 iff this pair was produced by the rare (high-IDF) shared-token blocking pass.",
+    "in_digit": "1.0 iff this pair was produced by the shared-postal/number-token blocking pass.",
+    "in_address": "1.0 iff this pair was produced by the address-token blocking pass.",
+    "block_tfidf": "That pass's own cosine/match score, if the pair passed through it (else NaN).",
+    "block_embed": "That pass's own cosine/match score, if the pair passed through it (else NaN).",
+    "block_rare": "That pass's own cosine/match score, if the pair passed through it (else NaN).",
+    "block_digit": "That pass's own cosine/match score, if the pair passed through it (else NaN).",
+    "block_address": "That pass's own cosine/match score, if the pair passed through it (else NaN).",
+    "n_passes": "Count of distinct blocking passes that surfaced this pair (1-5).",
+    "pair_sim": "Ranking score used for context features: mean of name/address token-set ratio (name-only if address is missing).",
+    "rank_in_s1": "This candidate's rank (1=best) among all candidates blocked for its S1.",
+    "gap_to_best_s1": "pair_sim gap between this candidate and the S1's single best-scoring candidate.",
+    "n_cands_s1": "Total candidate count blocked for this S1 (neighbourhood size).",
+    "rank_in_cand": "This S1's rank (1=best) among all S1s competing for the same candidate (reverse view).",
+    "gap_to_best_cand": "pair_sim gap between this S1 and the candidate's single best-scoring competing S1.",
+    "n_s1_for_cand": "Count of distinct S1s that blocked this same candidate (orphan/contention signal).",
+    "is_s3": "1.0 iff the candidate is from Source 3, 0.0 if Source 2.",
+}
+
+#: Feature -> family, read against CLAUDE.md §6.3's grouping plus the task's Part 5
+#: buckets. Assigned by hand against ``features.py`` rather than inferred from name
+#: prefixes at runtime, since a couple of features (``name_tfidf_cos``,
+#: ``addr_tfidf_cos``, ``digit_*``/``house_equal``/``long_num_equal``) belong to a
+#: more specific family (TF-IDF, NUMERIC/DIGIT) than a naive "name_"/"addr_" prefix
+#: split would give them.
+FEATURE_FAMILIES: dict[str, str] = {
+    **{f: "TF-IDF" for f in ("name_tfidf_cos", "addr_tfidf_cos")},
+    **{f: "EMBEDDING" for f in ("emb_cos",)},
+    **{f: "NUMERIC/DIGIT" for f in (
+        "digit_jaccard", "digit_shared", "digit_conflict", "digit_cand_subset",
+        "house_equal", "long_num_equal")},
+    **{f: "COUNTRY" for f in ("same_country",)},
+    **{f: "LENGTH/MISSINGNESS" for f in (
+        "name_len_ratio", "addr_empty_s1", "addr_empty_cand")},
+    **{f: "NAME" for f in (
+        "name_jw", "name_ratio", "name_token_set", "name_token_sort", "name_partial",
+        "name_full_token_set", "name_compact_ratio", "name_compact_partial",
+        "name_core_exact", "name_compact_exact", "suffix_equal", "suffix_both",
+        "suffix_conflict", "suffix_one_missing", "acronym_match", "name_token_jaccard",
+        "first_token_equal", "cand_is_website", "cand_has_dba")},
+    **{f: "ADDRESS" for f in (
+        "addr_ratio", "addr_token_set", "addr_token_sort", "addr_partial",
+        "addr_token_jaccard", "landmark_jaccard", "region_equal")},
+    **{f: "OTHER" for f in (
+        "in_tfidf", "in_embed", "in_rare", "in_digit", "in_address",
+        "block_tfidf", "block_embed", "block_rare", "block_digit", "block_address",
+        "n_passes", "pair_sim", "rank_in_s1", "gap_to_best_s1", "n_cands_s1",
+        "rank_in_cand", "gap_to_best_cand", "n_s1_for_cand", "is_s3")},
+}
+
+#: Coarse value-shape per feature, for Part 1's "data type/range" column. Features not
+#: listed here (e.g. a future features.py addition) are reported as "unknown (not yet
+#: annotated)" rather than guessed.
+_RANGE_UNIT_NAN = "float32 in [0, 1] (NaN if either side's field is empty)"
+_RANGE_UNIT = "float32 in [0, 1]"
+_RANGE_FLAG_NAN = "{0.0, 1.0} flag (NaN if not applicable to this pair)"
+_RANGE_FLAG = "{0.0, 1.0} flag"
+_RANGE_COUNT = "non-negative integer count (unbounded)"
+_RANGE_RANK = "positive integer rank, 1 = best (unbounded)"
+_RANGE_GAP = "float >= 0, unbounded (0 = tied for best)"
+FEATURE_RANGES: dict[str, str] = {
+    **{f: _RANGE_UNIT for f in (
+        "name_jw", "name_ratio", "name_token_set", "name_token_sort", "name_partial",
+        "name_full_token_set", "name_compact_ratio", "name_compact_partial",
+        "name_tfidf_cos", "name_token_jaccard", "name_len_ratio", "addr_tfidf_cos")},
+    **{f: _RANGE_UNIT_NAN for f in (
+        "addr_ratio", "addr_token_set", "addr_token_sort", "addr_partial",
+        "addr_token_jaccard", "digit_jaccard", "landmark_jaccard")},
+    **{f: _RANGE_FLAG for f in (
+        "name_core_exact", "name_compact_exact", "acronym_match", "cand_is_website",
+        "cand_has_dba", "addr_empty_s1", "addr_empty_cand", "same_country", "is_s3",
+        "suffix_both")},
+    **{f: _RANGE_FLAG_NAN for f in (
+        "suffix_equal", "suffix_conflict", "suffix_one_missing", "first_token_equal",
+        "digit_conflict", "digit_cand_subset", "house_equal", "long_num_equal",
+        "region_equal", "in_tfidf", "in_embed", "in_rare", "in_digit", "in_address")},
+    **{f: _RANGE_COUNT for f in (
+        "digit_shared", "n_passes", "n_cands_s1", "n_s1_for_cand")},
+    **{f: _RANGE_RANK for f in ("rank_in_s1", "rank_in_cand")},
+    **{f: _RANGE_GAP for f in ("gap_to_best_s1", "gap_to_best_cand")},
+    "pair_sim": _RANGE_UNIT_NAN,
+    "emb_cos": "float32, typically in [-1, 1] (cosine of unit-normalised embeddings); NaN if embeddings disabled",
+    **{f: "float32 in [0, 1] (NaN if this pair never passed that blocking pass)"
+       for f in ("block_tfidf", "block_embed", "block_rare", "block_digit", "block_address")},
+}
+
+#: Feature-name groups whose members are near-duplicate similarity measures of the
+#: *same* underlying string pair (documented by inspection of features.py, not
+#: inferred from a correlation threshold) -- i.e. a-priori redundancy candidates the
+#: model may not need all of. Membership here does NOT by itself mean a feature is
+#: useless (LightGBM's gain importance in Part 5 is the actual evidence); it only
+#: flags where redundancy is architecturally plausible so the report can cross-check
+#: it against measured correlation and importance.
+_REDUNDANCY_GROUPS: list[tuple[str, ...]] = [
+    ("name_jw", "name_ratio", "name_token_set", "name_token_sort", "name_partial",
+     "name_full_token_set", "name_compact_ratio", "name_compact_partial", "name_tfidf_cos"),
+    ("name_core_exact", "name_compact_exact"),
+    ("addr_ratio", "addr_token_set", "addr_token_sort", "addr_partial", "addr_tfidf_cos",
+     "addr_token_jaccard"),
+    ("digit_jaccard", "digit_shared", "digit_cand_subset"),
+    ("rank_in_s1", "gap_to_best_s1"), ("rank_in_cand", "gap_to_best_cand"),
+]
+
+
+def _quantiles(x: np.ndarray) -> dict:
+    """p50/p75/p90/p95/p99/max/mean/n of a 1-D array; all-null summary if empty."""
+    x = np.asarray(x, dtype=float)
+    x = x[~np.isnan(x)]
+    if len(x) == 0:
+        return {"n": 0, "p50": None, "p75": None, "p90": None, "p95": None,
+                "p99": None, "max": None, "mean": None}
+    return {
+        "n": int(len(x)),
+        "p50": float(np.quantile(x, 0.50)), "p75": float(np.quantile(x, 0.75)),
+        "p90": float(np.quantile(x, 0.90)), "p95": float(np.quantile(x, 0.95)),
+        "p99": float(np.quantile(x, 0.99)), "max": float(x.max()), "mean": float(x.mean()),
+    }
+
+
+def build_feature_audit(feats: pd.DataFrame, model) -> pd.DataFrame:
+    """Part 1 + part of Part 5: one row per model input feature.
+
+    Combines the hand-authored meaning/family/range annotations above with two
+    numbers actually measured from this run: each feature's Pearson correlation
+    with the binary label (a cheap, model-free discrimination signal -- separate
+    from, and a cross-check on, the LightGBM gain importance computed later) and
+    its maximum absolute correlation with any *other* feature (the empirical
+    redundancy check, cross-referenced against ``_REDUNDANCY_GROUPS``).
+    """
+    cols = feature_columns(feats)
+    label = feats["label"].to_numpy(dtype=float)
+    num = feats[cols].to_numpy(dtype=float)
+    label_corr: dict[str, float] = {}
+    with np.errstate(invalid="ignore", divide="ignore"):
+        for i, c in enumerate(cols):
+            col = num[:, i]
+            mask = ~np.isnan(col)
+            if mask.sum() < 2 or np.nanstd(col) == 0:
+                label_corr[c] = float("nan")
+                continue
+            corr = np.corrcoef(col[mask], label[mask])[0, 1]
+            label_corr[c] = float(corr) if np.isfinite(corr) else float("nan")
+        corr_matrix = pd.DataFrame(num, columns=cols).corr().to_numpy()
+    max_other_corr: dict[str, float] = {}
+    for i, c in enumerate(cols):
+        row = np.delete(corr_matrix[i], i)
+        row = row[~np.isnan(row)]
+        max_other_corr[c] = float(np.abs(row).max()) if len(row) else float("nan")
+
+    redundancy_group = {}
+    for group in _REDUNDANCY_GROUPS:
+        for f in group:
+            redundancy_group.setdefault(f, ";".join(g for g in group))
+
+    rows = []
+    for c in cols:
+        rows.append({
+            "feature": c,
+            "family": FEATURE_FAMILIES.get(c, "OTHER"),
+            "meaning": FEATURE_MEANINGS.get(c, "(not yet annotated -- new column, see features.py)"),
+            "dtype_range": FEATURE_RANGES.get(c, "unknown (not yet annotated)"),
+            "derivation": "raw" if c in ("same_country", "is_s3") else "derived",
+            "label_correlation": label_corr.get(c),
+            "max_abs_correlation_with_other_feature": max_other_corr.get(c),
+            "a_priori_redundancy_group": redundancy_group.get(c, ""),
+            "empirically_redundant": bool(max_other_corr.get(c) is not None
+                                          and not np.isnan(max_other_corr.get(c, np.nan))
+                                          and max_other_corr[c] >= 0.90),
+        })
+    audit = pd.DataFrame(rows)
+    imp = feature_importance(model).set_index("feature")
+    audit["gain_importance"] = audit["feature"].map(imp["gain"]).fillna(0.0)
+    audit["split_importance"] = audit["feature"].map(imp["split"]).fillna(0.0)
+    return audit.sort_values("gain_importance", ascending=False).reset_index(drop=True)
+
+
+def _family_summary(audit: pd.DataFrame) -> pd.DataFrame:
+    """Part 5: total/share of gain importance per feature family."""
+    g = audit.groupby("family")["gain_importance"].sum().sort_values(ascending=False)
+    total = g.sum()
+    return pd.DataFrame({
+        "family": g.index, "gain_importance": g.to_numpy(),
+        "gain_share": (g / total).to_numpy() if total else np.zeros(len(g)),
+    }).reset_index(drop=True)
+
+
+def run_feature_hard_negative_audit(sample: float = 0.0045,
+                                    use_embeddings: bool = True) -> dict:
+    """Final pre-lock diagnostic: feature discrimination audit + hard-negative score
+    overlap, run once on the "both40" (K_TFIDF_NAME=K_EMBEDDING=40) candidate
+    configuration -- the leading candidate the task names -- against the existing
+    validation split and existing pipeline functions only (measurement-only; changes
+    no config default, no feature, no model, and no decision logic).
+
+    Reuses, unmodified: ``blocking.generate_candidates`` (both40 k_overrides, same
+    pattern as :func:`run_blocking_k_downstream`), ``features.build_features``/
+    ``label_pairs``, :func:`_fit_and_tune_with_oof` (GroupKFold OOF fit + threshold
+    tuning, train-side only), ``decide.apply_threshold`` (production one-to-one ON),
+    ``evaluate.score_report``, and ``error_decomposition``'s
+    ``classify_true_pairs``/``false_positive_report``/``slice_report`` -- the same
+    stage classification :func:`run_error_decomposition` already uses to separate
+    blocking failures from matcher failures, which is exactly Part 3/6's question.
+
+    Writes ``artifacts/diagnostics/feature_hard_negative_audit_<ts>.json`` (full
+    report incl. the feature audit table, score quantiles, gate booleans and the
+    A/B recommendation) and a companion ``..._<ts>.tsv`` (the feature audit table,
+    for spreadsheet inspection). Returns the JSON-serialisable report dict. Never
+    touches ``output/``, never runs ``--mode test``, never changes a ``config.py``
+    default.
+    """
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    _log(f"feature/hard-negative audit: sample={sample}, config=both40")
+    s1, s2, s3, truth = rp._load_train(sample)
+    prep = rp.prepare(s1, s2, s3, use_embeddings=use_embeddings, use_cache=True)
+    s1_ids = list(prep["s1"][config.ID_COL])
+    s1_country = dict(zip(prep["s1"][config.ID_COL], prep["s1"][config.COUNTRY_COL]))
+    n_other = len(prep["others"])
+    train_ids, valid_ids = rp.split_s1(s1_ids, truth)
+
+    both40 = next(c for c in blocking_k_downstream_configs() if c["name"] == "both40")
+    k_overrides = {k: v for k, v in both40.items() if k != "name"}
+    cands = generate_candidates(prep["s1"], prep["others"], embeddings=prep["emb"],
+                                verbose=False, k_overrides=k_overrides)
+    block_stats = report_blocking_stats(cands, truth, s1_ids, n_other, s1_country, verbose=False)
+
+    feats = build_features(cands, prep["s1"], prep["others"], prep["emb"])
+    feats["label"] = label_pairs(feats, truth)
+    in_train = feats["s1_id"].isin(set(train_ids)).to_numpy()
+    cols = feature_columns(feats)
+    fit = _fit_and_tune_with_oof(feats[in_train], truth, train_ids)
+    tau, singleton_tau = fit["tau"], fit["singleton_tau"]
+
+    valid_feats = feats[~in_train].reset_index(drop=True)
+    valid_scored = valid_feats[["s1_id", "cand_id", "label"]].assign(
+        prob=predict(fit["model"], valid_feats[cols]))
+    valid_truth = {s: truth.get(s, []) for s in valid_ids}
+    pred = apply_threshold(valid_scored, tau, valid_ids, singleton_tau)
+    valid_report = score_report(pred, valid_truth, valid_ids, groups=s1_country)
+
+    # --- Part 1: feature audit (measured against the training-side fit) ------------
+    audit = build_feature_audit(feats[in_train], fit["model"])
+    family_summary = _family_summary(audit)
+
+    # --- Part 2/3/4: reuse the existing error-decomposition primitives, exactly as
+    # run_error_decomposition does, but on this both40-configured validation split.
+    classified = edecomp.classify_true_pairs(
+        prep["s1"], prep["others"], cands, valid_scored, pred, valid_truth, tau)
+    fp = edecomp.false_positive_report(valid_scored, pred, valid_truth)
+    slices = edecomp.slice_report(classified, prep["s1"], prep["others"], cands, s1_country)
+
+    merged = valid_scored.merge(valid_feats[["s1_id", "cand_id", *cols]],
+                                on=["s1_id", "cand_id"], how="left")
+    pos = merged[merged["label"] == 1]
+    neg = merged[merged["label"] == 0]
+
+    # --- Part 2: hard-negative score overlap ----------------------------------------
+    hard_neg_cuts = {"score_ge_0.5": 0.5, "score_ge_0.7": 0.7,
+                     "score_ge_tau": tau, "score_ge_0.9": 0.9}
+    hard_negative_stats = {
+        name: {"threshold": thr, **_quantiles(neg.loc[neg["prob"] >= thr, "prob"].to_numpy())}
+        for name, thr in hard_neg_cuts.items()
+    }
+    score_overlap = {
+        "true_positive_scores": _quantiles(pos["prob"].to_numpy()),
+        "true_negative_scores": _quantiles(neg["prob"].to_numpy()),
+        "hard_negatives": hard_negative_stats,
+        "negatives_at_or_above_tau": int((neg["prob"] >= tau).sum()),
+        "positives_at_or_above_tau": int((pos["prob"] >= tau).sum()),
+        "negatives_within_0.05_of_tau_below": int(
+            ((neg["prob"] >= tau - 0.05) & (neg["prob"] < tau)).sum()),
+        "positives_within_0.05_of_tau_above": int(
+            ((pos["prob"] < tau + 0.05) & (pos["prob"] >= tau)).sum()),
+    }
+
+    # --- Part 3: true matches that are hard to score --------------------------------
+    miss_cuts = {"below_0.5": 0.5, "below_0.7": 0.7, "below_tau": tau}
+    missed_positive_stats = {}
+    for name, thr in miss_cuts.items():
+        missed = pos[pos["prob"] < thr]
+        by_country = (missed.assign(country=missed["s1_id"].map(s1_country))
+                     .groupby("country").size().to_dict())
+        by_source = missed.assign(
+            source=np.where(missed["cand_id"].str.startswith("S3-"), "S3", "S2")
+        ).groupby("source").size().to_dict()
+        missed_positive_stats[name] = {
+            "n": int(len(missed)),
+            "share_of_true_positives_in_candidates": (
+                float(len(missed) / len(pos)) if len(pos) else None),
+            "by_country": by_country, "by_source": by_source,
+            "mean_n_cands_s1": float(missed["n_cands_s1"].mean()) if len(missed) else None,
+            "mean_addr_empty_s1": float(missed["addr_empty_s1"].mean()) if len(missed) else None,
+            "mean_addr_empty_cand": float(missed["addr_empty_cand"].mean()) if len(missed) else None,
+            "mean_name_core_exact": float(missed["name_core_exact"].mean()) if len(missed) else None,
+        }
+    # Rejected-by-matcher despite being a candidate: exactly edecomp's own
+    # "matcher_false_negative" stage -- true matches that entered the candidate set
+    # (so blocking succeeded) but scored below tau (so the matcher, not blocking, is
+    # responsible). This is the one number Part 6's gate condition 4 hinges on.
+    stage_counts = (classified["stage"].value_counts().to_dict() if len(classified) else {})
+
+    # --- Part 4: false positives at tau ---------------------------------------------
+    fp_merged = fp.merge(valid_feats[["s1_id", "cand_id", *cols]], on=["s1_id", "cand_id"],
+                        how="left") if len(fp) else fp.assign(**{c: [] for c in cols})
+    fp_stats = {
+        "n_false_positives": int(len(fp)),
+        "n_top_wrong": int(fp["top_wrong"].sum()) if len(fp) else 0,
+        "by_source": (np.where(fp_merged["cand_id"].str.startswith("S3-"), "S3", "S2")
+                      if len(fp_merged) else np.array([])),
+        "mean_name_token_set": float(fp_merged["name_token_set"].mean()) if len(fp_merged) else None,
+        "mean_addr_token_set": float(fp_merged["addr_token_set"].mean()) if len(fp_merged) else None,
+        "mean_digit_shared": float(fp_merged["digit_shared"].mean()) if len(fp_merged) else None,
+        "mean_n_cands_s1": float(fp_merged["n_cands_s1"].mean()) if len(fp_merged) else None,
+        "mean_same_country": float(fp_merged["same_country"].mean()) if len(fp_merged) else None,
+    }
+    fp_stats["by_source"] = (pd.Series(fp_stats["by_source"]).value_counts().to_dict()
+                             if len(fp_merged) else {})
+    fp_country = (fp_merged.assign(country=fp_merged["s1_id"].map(s1_country))
+                 .groupby("country").size().to_dict()) if len(fp_merged) else {}
+
+    # --- Part 6: hard-negative gate ---------------------------------------------------
+    n_true_pairs = len(classified)
+    n_in_candidates = int(sum(v for k, v in stage_counts.items()
+                              if k in ("correct_match", "matcher_false_negative",
+                                       "decision_false_negative")))
+    n_matcher_fn = int(stage_counts.get("matcher_false_negative", 0))
+    n_blocking_loss = int(stage_counts.get("blocking_false_negative", 0)
+                          + stage_counts.get("representation_failure", 0))
+    n_hard_neg_at_tau = int(hard_negative_stats["score_ge_tau"]["n"])
+
+    gate = {
+        "condition_1_material_true_matches_in_candidates": {
+            "value": n_in_candidates >= 20,
+            "detail": f"{n_in_candidates} of {n_true_pairs} true pairs entered the "
+                      f"both40 candidate set (blocking succeeded)."},
+        "condition_2_systematically_rejected_by_matcher": {
+            "value": n_matcher_fn >= 10 and (n_matcher_fn / n_in_candidates >= 0.05
+                                             if n_in_candidates else False),
+            "detail": f"{n_matcher_fn} true pairs entered the candidate set but scored "
+                      f"below tau={tau:.3f} ('matcher_false_negative')."},
+        "condition_3_hard_negatives_overlap_near_threshold": {
+            "value": n_hard_neg_at_tau >= 10,
+            "detail": f"{n_hard_neg_at_tau} negative pairs scored at or above the "
+                      f"selected tau={tau:.3f}."},
+        "condition_4_weakness_is_matcher_not_blocking": {
+            "value": n_matcher_fn > n_blocking_loss,
+            "detail": f"matcher_false_negative={n_matcher_fn} vs. "
+                      f"blocking-caused misses (blocking_false_negative+"
+                      f"representation_failure)={n_blocking_loss}."},
+    }
+    all_conditions_hold = all(v["value"] for v in gate.values())
+    recommendation = "B" if all_conditions_hold else "A"
+    conclusion = (
+        "Remaining true-match losses are still dominated by blocking (blocking_false_negative"
+        f"+representation_failure={n_blocking_loss} vs. matcher_false_negative={n_matcher_fn})."
+        if not all_conditions_hold else
+        "True matches are entering the candidate set in material numbers and being "
+        "systematically rejected by the matcher, with hard negatives overlapping the "
+        "positive score range near tau -- a targeted matcher/feature change is justified."
+    )
+
+    report = {
+        "kind": "feature_hard_negative_audit", "timestamp": ts, "sample": sample,
+        "use_embeddings": use_embeddings, "git_commit": rp._git_hash(),
+        "dataset_file_hashes": diag.dataset_file_hashes(config.TRAIN_FILES),
+        "env": diag.env_info(),
+        "blocking_configuration": {"name": "both40", **k_overrides},
+        "threshold_configuration": {"tau": tau, "singleton_tau": singleton_tau,
+                                    "source": "tuned on OOF predictions, train-side only "
+                                              "(decide.tune_threshold via _fit_and_tune_with_oof), "
+                                              "not hardcoded"},
+        "n_s1": len(s1_ids), "n_other": n_other,
+        "n_train_s1": len(train_ids), "n_valid_s1": len(valid_ids),
+        "block_stats": block_stats,
+        "n_candidate_pairs": int(len(cands)),
+        "n_positive_pairs_valid": int(len(pos)), "n_negative_pairs_valid": int(len(neg)),
+        "oof_macro_f05": fit["oof_f05"], "valid_report": valid_report,
+        "score_overlap": score_overlap,
+        "missed_positive_stats": missed_positive_stats,
+        "stage_counts": stage_counts,
+        "false_positive_stats": {**fp_stats, "by_country": fp_country},
+        "feature_family_summary": family_summary.to_dict(orient="records"),
+        "gate": gate,
+        "recommendation": recommendation,
+        "conclusion": conclusion,
+    }
+
+    DIAG_DIR.mkdir(parents=True, exist_ok=True)
+    json_path = DIAG_DIR / f"feature_hard_negative_audit_{ts}.json"
+    tsv_path = DIAG_DIR / f"feature_hard_negative_audit_{ts}.tsv"
+    diag.save_json(report, json_path)
+    audit.to_csv(tsv_path, sep="\t", index=False)
+    _log(f"feature/hard-negative audit written to {json_path} and {tsv_path}")
+    _log(f"gate: {gate}")
+    _log(f"RECOMMENDATION: {recommendation} -- {conclusion}")
+    report["_audit_table_path"] = str(tsv_path)
+    report["_json_path"] = str(json_path)
+    return report
+
+
 # --- CLI ---------------------------------------------------------------------------------
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1855,6 +2306,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     help="S1 sample fraction (default: 0.0045, the reproducible baseline scale)")
     lc.add_argument("--no-embeddings", action="store_true")
 
+    fhn = sub.add_parser(
+        "feature-hard-negative",
+        help="Final pre-lock diagnostic: feature discrimination audit + hard-negative "
+             "score overlap on the both40 candidate configuration")
+    fhn.add_argument("--sample", type=float, default=0.0045,
+                     help="S1 sample fraction (default: 0.0045, the reproducible baseline scale)")
+    fhn.add_argument("--no-embeddings", action="store_true")
+
     return parser.parse_args(argv)
 
 
@@ -1883,6 +2342,8 @@ def main(argv: list[str] | None = None) -> None:
         run_decision_validation(args.sample, not args.no_embeddings)
     elif args.command == "loco":
         run_loco_comparison(args.sample, not args.no_embeddings)
+    elif args.command == "feature-hard-negative":
+        run_feature_hard_negative_audit(args.sample, not args.no_embeddings)
 
 
 if __name__ == "__main__":
