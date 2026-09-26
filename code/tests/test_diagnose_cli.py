@@ -170,6 +170,7 @@ def test_cli_parses_every_subcommand():
                 ["drift", "--with-candidates"],
                 ["convergence", "--sizes", "100", "200"],
                 ["resource-stage", "--stage", "embed"],
-                ["errors", "--no-embeddings"]):
+                ["errors", "--no-embeddings"],
+                ["blocking-ablation", "--sample", "0.0045"]):
         args = diagnose.parse_args(argv)
         assert args.command == argv[0]

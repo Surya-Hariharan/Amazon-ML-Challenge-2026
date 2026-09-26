@@ -17,6 +17,7 @@ Usage (from code/business_entity_resolution/)::
     python -m src.diagnose convergence --sizes 2000 5000 10000 25000 [--no-embeddings]
     python -m src.diagnose resource-stage --stage normalize|embed|block|features|all
     python -m src.diagnose errors [--sample 0.1] [--no-embeddings]
+    python -m src.diagnose blocking-ablation [--sample 0.0045] [--no-embeddings]
 
 Every subcommand is measurement-only: none of them changes ``output/``, and
 none of them is wired to run automatically -- each is a separate, explicit CLI
@@ -38,6 +39,7 @@ from . import diagnostics as diag
 from . import drift as drift_mod
 from . import error_decomposition as edecomp
 from . import run_pipeline as rp
+from .blocking import generate_candidates, report_blocking_stats
 from .decide import apply_threshold
 from .features import build_features, feature_columns, label_pairs
 from .io_utils import load_source, load_split
@@ -361,6 +363,134 @@ def run_error_decomposition(
            "one_to_one_removals": o2o, "slices": slices}
 
 
+# --- P1: blocking-K ablation ---------------------------------------------------------------
+
+#: One-factor-at-a-time sweep values per blocking pass (production baseline is
+#: config.K_TFIDF_NAME / K_EMBEDDING / K_RARE_TOKEN / K_POSTAL_TOKEN / K_ADDRESS).
+#: Keys match blocking.PASS_BITS / generate_candidates' k_overrides.
+_ABLATION_SWEEPS: dict[str, list[int]] = {
+    "tfidf": [10, 20, 40],
+    "embed": [10, 20, 40],
+    "rare": [5, 10, 20],
+    "digit": [5, 10, 20],
+    "address": [5, 10, 20],
+}
+
+
+def blocking_ablation_baseline() -> dict[str, int]:
+    """Production blocking-K baseline, read live from ``config`` (never hard-coded).
+
+    Reading these values here rather than duplicating literals means a future
+    change to a ``config.K_*`` default is picked up automatically and never
+    silently drifts out of sync with what ``generate_candidates`` actually
+    runs in production.
+    """
+    return {
+        "tfidf": config.K_TFIDF_NAME, "embed": config.K_EMBEDDING,
+        "rare": config.K_RARE_TOKEN, "digit": config.K_POSTAL_TOKEN,
+        "address": config.K_ADDRESS,
+    }
+
+
+def blocking_ablation_configs() -> list[dict]:
+    """16 one-factor-at-a-time blocking-K configurations: 1 baseline + 5x3 sweeps.
+
+    Each non-baseline entry copies the baseline dict and changes exactly one
+    pass's k to one of ``_ABLATION_SWEEPS[pass]``'s three values (including,
+    for completeness, the value that already equals the baseline -- so every
+    listed value is run as its own named configuration, matching the
+    requested 1 + 5*3 = 16 total exactly). Each dict has ``"name"`` plus one
+    key per pass (``tfidf``/``embed``/``rare``/``digit``/``address``); this
+    is the exact shape ``generate_candidates(..., k_overrides=...)`` expects
+    once ``"name"`` is stripped.
+    """
+    baseline = blocking_ablation_baseline()
+    configs = [{"name": "baseline", **baseline}]
+    for factor, values in _ABLATION_SWEEPS.items():
+        for v in values:
+            cfg = dict(baseline)
+            cfg[factor] = v
+            configs.append({"name": f"{factor}_{v}", **cfg})
+    return configs
+
+
+def run_blocking_ablation(
+    sample: float = 0.0045, use_embeddings: bool = True
+) -> pd.DataFrame:
+    """P1: cheap blocking-only screening sweep, one K at a time.
+
+    Loads the training split once (via ``run_pipeline._load_train``, the same
+    helper ``errors``/``convergence`` use) and normalises + embeds it once
+    (via the existing, unmodified ``run_pipeline.prepare``, with its normal
+    on-disk normalisation/embedding caches, per CLAUDE.md 7 -- embeddings are
+    never recomputed per configuration). For every configuration in
+    :func:`blocking_ablation_configs`, calls the existing, unmodified
+    ``blocking.generate_candidates`` -- the same union/de-duplication code
+    path production blocking uses -- passing that configuration's k values
+    through its ``k_overrides`` parameter; ``config.py``'s production K
+    defaults are never read for anything but the baseline row and are never
+    mutated. Scores every configuration with the existing, unmodified
+    ``blocking.report_blocking_stats`` (pair recall, S1 full recall, mean/max
+    candidates, n_pairs, reduction ratio, per-pass recall, per-country
+    recall). No feature generation, model training, threshold tuning or OOF
+    happens anywhere in this path, and ``output/`` and ``run_pipeline.py``'s
+    behaviour are untouched.
+
+    Writes one row per configuration to
+    ``artifacts/diagnostics/blocking_ablation_<timestamp>.tsv`` and a sidecar
+    ``blocking_ablation_<timestamp>.json`` with the configuration matrix and
+    environment info (mirroring ``run_baseline``'s report shape). Returns the
+    same frame as a :class:`pandas.DataFrame`.
+    """
+    s1, s2, s3, truth = rp._load_train(sample)
+    prep = rp.prepare(s1, s2, s3, use_embeddings=use_embeddings, use_cache=True)
+    s1_ids = list(prep["s1"][config.ID_COL])
+    s1_country = dict(zip(prep["s1"][config.ID_COL], prep["s1"][config.COUNTRY_COL]))
+    n_other = len(prep["others"])
+    configs = blocking_ablation_configs()
+    _log(f"blocking ablation: {len(configs)} configurations, "
+        f"{len(s1_ids):,} S1 x {n_other:,} others (sample={sample})")
+
+    rows = []
+    for cfg in configs:
+        name = cfg["name"]
+        k_overrides = {k: v for k, v in cfg.items() if k != "name"}
+        _log(f"blocking ablation: running '{name}' (k={k_overrides})")
+        with diag.ResourceTracker() as rt:
+            cands = generate_candidates(
+                prep["s1"], prep["others"], embeddings=prep["emb"],
+                verbose=False, k_overrides=k_overrides)
+        stats = report_blocking_stats(cands, truth, s1_ids, n_other, s1_country,
+                                      verbose=False)
+        row = {
+            "experiment": name, **{f"k_{k}": v for k, v in k_overrides.items()},
+            "sample": sample, "n_s1": len(s1_ids), "n_other": n_other,
+            **stats,
+            "runtime_seconds": rt.report["runtime_s"],
+            "peak_rss_bytes": rt.report["peak_rss_bytes"],
+            "current_rss_bytes": rt.report["current_rss_bytes"],
+        }
+        rows.append(row)
+        _log(f"blocking ablation: '{name}' pair_recall={stats['pair_recall']:.4f} "
+            f"mean_candidates={stats['mean_candidates']:.2f} "
+            f"runtime={row['runtime_seconds']:.1f}s")
+
+    out = pd.DataFrame(rows)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    DIAG_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = DIAG_DIR / f"blocking_ablation_{ts}.tsv"
+    out.to_csv(out_path, sep="\t", index=False)
+    meta = {
+        "kind": "blocking_ablation", "sample": sample, "use_embeddings": use_embeddings,
+        "n_s1": len(s1_ids), "n_other": n_other, "configs": configs,
+        "dataset_file_hashes": diag.dataset_file_hashes(config.TRAIN_FILES),
+        "env": diag.env_info(),
+    }
+    diag.save_json(meta, DIAG_DIR / f"blocking_ablation_{ts}.json")
+    _log(f"blocking ablation report written to {out_path}")
+    return out
+
+
 # --- CLI ---------------------------------------------------------------------------------
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -390,6 +520,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     e.add_argument("--sample", type=float, default=1.0)
     e.add_argument("--no-embeddings", action="store_true")
 
+    k = sub.add_parser(
+        "blocking-ablation",
+        help="P1: cheap blocking-only K ablation (one-factor-at-a-time sweep)")
+    k.add_argument("--sample", type=float, default=0.0045,
+                   help="S1 sample fraction (default: 0.0045, the reproducible baseline scale)")
+    k.add_argument("--no-embeddings", action="store_true",
+                   help="skip the embedding pass entirely (embed-K rows become no-ops)")
+
     return parser.parse_args(argv)
 
 
@@ -406,6 +544,8 @@ def main(argv: list[str] | None = None) -> None:
         run_resource_stage(args.stage)
     elif args.command == "errors":
         run_error_decomposition(args.sample, not args.no_embeddings)
+    elif args.command == "blocking-ablation":
+        run_blocking_ablation(args.sample, not args.no_embeddings)
 
 
 if __name__ == "__main__":

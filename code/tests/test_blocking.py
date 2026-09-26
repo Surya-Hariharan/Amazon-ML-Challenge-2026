@@ -149,6 +149,66 @@ def test_generate_candidates_schema_and_recall(synthetic_blocked):
         assert stats[f"pairs_{p}"] > 0, p
 
 
+def test_generate_candidates_k_overrides_change_only_the_named_pass(synthetic_blocked):
+    """k_overrides changes exactly the requested pass's k, at the actual call site,
+    without mutating config -- the P1 blocking-ablation diagnostic's core contract."""
+    s1n, others, _, baseline_cands = synthetic_blocked
+    emb = (fake_encoder(blocking.embedding_text(s1n)), fake_encoder(blocking.embedding_text(others)))
+    before = {name: getattr(config, attr) for name, attr in (
+        ("tfidf", "K_TFIDF_NAME"), ("embed", "K_EMBEDDING"), ("rare", "K_RARE_TOKEN"),
+        ("digit", "K_POSTAL_TOKEN"), ("address", "K_ADDRESS"))}
+
+    cands = generate_candidates(s1n, others, embeddings=emb, verbose=False,
+                                k_overrides={"tfidf": 1})
+
+    # Production config is never mutated by passing k_overrides.
+    assert config.K_TFIDF_NAME == before["tfidf"]
+    assert config.K_EMBEDDING == before["embed"]
+    assert config.K_RARE_TOKEN == before["rare"]
+    assert config.K_POSTAL_TOKEN == before["digit"]
+    assert config.K_ADDRESS == before["address"]
+
+    # k=1 for tfidf can only ever shrink (never grow) that pass's pair count relative
+    # to the production-default run, while every other pass's pair count is untouched.
+    base_by_pass = {p: (baseline_cands["passes"].to_numpy() & bit > 0).sum()
+                    for p, bit in PASS_BITS.items()}
+    new_by_pass = {p: (cands["passes"].to_numpy() & bit > 0).sum()
+                  for p, bit in PASS_BITS.items()}
+    assert new_by_pass["tfidf"] <= base_by_pass["tfidf"]
+    for p in ("rare", "digit", "address", "embed"):
+        assert new_by_pass[p] == base_by_pass[p]
+
+
+def test_generate_candidates_k_overrides_none_matches_production_default(synthetic_blocked):
+    """k_overrides=None (the default) reproduces the exact pre-existing candidate set --
+    adding the parameter changes nothing about ordinary production calls."""
+    s1n, others, _, baseline_cands = synthetic_blocked
+    emb = (fake_encoder(blocking.embedding_text(s1n)), fake_encoder(blocking.embedding_text(others)))
+    cands = generate_candidates(s1n, others, embeddings=emb, verbose=False)
+    pd.testing.assert_frame_equal(
+        cands.sort_values(["s1_id", "cand_id"]).reset_index(drop=True),
+        baseline_cands.sort_values(["s1_id", "cand_id"]).reset_index(drop=True))
+
+
+def test_generate_candidates_k_overrides_reaches_the_pass_function(monkeypatch):
+    """An explicit k_override is actually threaded into the underlying pass call,
+    not merely accepted and ignored."""
+    s1 = pd.DataFrame({"entity_id": ["S1-1"], "country": ["US"], "name_core": ["acme"],
+                       "digits": [""], "first_token": ["acme"], "addr_norm": ["1 main st"]})
+    x = pd.DataFrame({"entity_id": ["S2-1"], "country": ["US"], "name_core": ["acme"],
+                      "digits": [""], "first_token": ["acme"], "addr_norm": ["1 main st"]})
+    seen_k = {}
+
+    def spy_tfidf(q_names, x_names, k=config.K_TFIDF_NAME):
+        seen_k["tfidf"] = k
+        return blocking._empty_pass()
+
+    monkeypatch.setattr(blocking, "tfidf_name_pass", spy_tfidf)
+    generate_candidates(s1, x, embeddings=None, use_address_pass=False, verbose=False,
+                        k_overrides={"tfidf": 7})
+    assert seen_k["tfidf"] == 7
+
+
 def test_no_cross_country_candidates(synthetic_blocked):
     """Within-country blocking never proposes a candidate from another country."""
     s1n, others, _, cands = synthetic_blocked

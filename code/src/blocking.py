@@ -398,6 +398,7 @@ def generate_candidates(
     within_country: bool = config.BLOCK_WITHIN_COUNTRY,
     use_address_pass: bool = config.USE_ADDRESS_PASS,
     verbose: bool = True,
+    k_overrides: Mapping[str, int] | None = None,
 ) -> pd.DataFrame:
     """Run every pass per blocking group and return the de-duplicated union.
 
@@ -409,12 +410,20 @@ def generate_candidates(
         within_country: block within each country string.
         use_address_pass: include pass 5.
         verbose: print per-group progress.
+        k_overrides: optional ``{pass_name: k}`` (keys from ``PASS_BITS``, i.e.
+            ``"tfidf"``/``"embed"``/``"rare"``/``"digit"``/``"address"``) to run a pass
+            at a k other than its ``config.K_*`` default. Missing keys keep the
+            default k for that pass. ``None`` (the default) reproduces production
+            behaviour exactly -- this parameter exists only for the blocking-K
+            ablation diagnostic (``src.diagnose blocking-ablation``), never for
+            production runs.
 
     Returns:
         One row per (S1, candidate) pair with ``s1_id``, ``cand_id``, ``passes``
         (bitmask of ``PASS_BITS``) and ``score_<pass>`` (NaN when that pass did not
         return the pair).
     """
+    ko = k_overrides or {}
     s1 = s1.reset_index(drop=True)
     others = others.reset_index(drop=True)
     frames = []
@@ -424,15 +433,17 @@ def generate_candidates(
         t0 = time.time()
         q, x = s1.iloc[q_idx].reset_index(drop=True), others.iloc[x_idx].reset_index(drop=True)
         runs = {
-            "tfidf": lambda: tfidf_name_pass(q["name_core"], x["name_core"]),
-            "rare": lambda: rare_token_pass(q, x),
-            "digit": lambda: digit_token_pass(q, x),
+            "tfidf": lambda: tfidf_name_pass(q["name_core"], x["name_core"],
+                                             k=ko.get("tfidf", config.K_TFIDF_NAME)),
+            "rare": lambda: rare_token_pass(q, x, k=ko.get("rare", config.K_RARE_TOKEN)),
+            "digit": lambda: digit_token_pass(q, x, k=ko.get("digit", config.K_POSTAL_TOKEN)),
         }
         if embeddings is not None:
             runs["embed"] = lambda: embedding_pass(
-                np.asarray(embeddings[0][q_idx]), np.asarray(embeddings[1][x_idx]))
+                np.asarray(embeddings[0][q_idx]), np.asarray(embeddings[1][x_idx]),
+                k=ko.get("embed", config.K_EMBEDDING))
         if use_address_pass:
-            runs["address"] = lambda: address_pass(q, x)
+            runs["address"] = lambda: address_pass(q, x, k=ko.get("address", config.K_ADDRESS))
         for name, run in runs.items():
             res = run()
             res = pd.DataFrame({
