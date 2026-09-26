@@ -19,6 +19,8 @@ Usage (from code/business_entity_resolution/)::
     python -m src.diagnose errors [--sample 0.1] [--no-embeddings]
     python -m src.diagnose blocking-ablation [--sample 0.0045] [--no-embeddings]
     python -m src.diagnose blocking-k-downstream [--sample 0.0045] [--no-embeddings]
+    python -m src.diagnose chunk-equality [--sample 0.0045]
+    python -m src.diagnose fp16-retrieval [--sample 0.0045]
 
 Every subcommand is measurement-only: none of them changes ``output/``, and
 none of them is wired to run automatically -- each is a separate, explicit CLI
@@ -40,12 +42,14 @@ from . import diagnostics as diag
 from . import drift as drift_mod
 from . import error_decomposition as edecomp
 from . import run_pipeline as rp
-from .blocking import generate_candidates, report_blocking_stats
+from .blocking import country_groups, dense_topk, generate_candidates, report_blocking_stats
 from .decide import apply_threshold, tune_threshold
-from .evaluate import score_report
+from .evaluate import blocking_recall, score_report
 from .features import build_features, feature_columns, label_pairs
 from .io_utils import load_source, load_split
 from .model import group_folds, predict, train_full, train_oof
+
+Encoder = Callable[[list[str]], np.ndarray]
 
 DIAG_DIR = config.ARTIFACTS_DIR / "diagnostics"
 
@@ -708,6 +712,456 @@ def run_blocking_k_downstream(sample: float = 0.0045, use_embeddings: bool = Tru
     return out
 
 
+# --- E3/E4 shared helpers: dense-retrieval candidate comparison ---------------------------
+
+def _dense_candidates_grouped(
+    s1: pd.DataFrame, others: pd.DataFrame, embeddings: tuple[np.ndarray, np.ndarray],
+    k: int, topk_fn: Callable[[np.ndarray, np.ndarray, int], tuple],
+    within_country: bool = config.BLOCK_WITHIN_COUNTRY,
+) -> dict[str, set[str]]:
+    """``{s1_id: candidate_id set}`` from one dense-embedding top-k pass.
+
+    Groups by country with the exact production primitive (``blocking.country_groups``
+    -- the same call ``blocking.generate_candidates`` makes for every pass), so which
+    S1/candidate pairs are even eligible to be compared is identical to production.
+    The actual top-k search is supplied as ``topk_fn`` so E3 (chunk size) and E4
+    (compute dtype) can each plug in a different variant of the retrieval primitive
+    while everything else about the comparison -- grouping, ID mapping, candidate-set
+    construction -- stays shared and identical between the two experiments.
+    """
+    s1 = s1.reset_index(drop=True)
+    others = others.reset_index(drop=True)
+    out: dict[str, set[str]] = {}
+    s1_ids_all = s1[config.ID_COL].to_numpy()
+    cand_ids_all = others[config.ID_COL].to_numpy()
+    for _country, q_idx, x_idx in country_groups(s1, others, within_country):
+        if len(x_idx) == 0:
+            continue
+        q_emb = np.asarray(embeddings[0][q_idx])
+        x_emb = np.asarray(embeddings[1][x_idx])
+        qi, xi, _s = topk_fn(q_emb, x_emb, k)
+        s1g, candg = s1_ids_all[q_idx], cand_ids_all[x_idx]
+        for qq, xx in zip(qi, xi):
+            out.setdefault(s1g[qq], set()).add(candg[xx])
+    return out
+
+
+def _candidate_set_diff(a: dict[str, set[str]], b: dict[str, set[str]],
+                        max_sample: int = 20) -> dict:
+    """Exact-equality diff between two ``{s1_id: candidate_id set}`` maps.
+
+    ``a`` is the reference (current-production) side. Returns the total pairs on
+    each side, how many S1s have a differing candidate set, the total number of
+    pairs present only in ``a`` ("missing" -- lost by switching to ``b``) or only
+    in ``b`` ("extra" -- gained by switching to ``b``), whether the two maps are
+    byte-for-byte identical, and a small sample (capped at ``max_sample``) of the
+    differing S1 IDs for spot-checking -- never the full candidate lists, so the
+    report stays a bounded size even at larger sample fractions.
+    """
+    all_s1 = sorted(set(a) | set(b))
+    n_diff_s1 = 0
+    n_missing = 0  # in a, not in b
+    n_extra = 0  # in b, not in a
+    diff_sample: list[str] = []
+    for s in all_s1:
+        sa, sb = a.get(s, set()), b.get(s, set())
+        if sa != sb:
+            n_diff_s1 += 1
+            n_missing += len(sa - sb)
+            n_extra += len(sb - sa)
+            if len(diff_sample) < max_sample:
+                diff_sample.append(s)
+    return {
+        "n_s1_total": len(all_s1),
+        "n_pairs_a": sum(len(v) for v in a.values()),
+        "n_pairs_b": sum(len(v) for v in b.values()),
+        "n_s1_differing": n_diff_s1,
+        "n_missing_pairs": n_missing,
+        "n_extra_pairs": n_extra,
+        "exact_equal": n_diff_s1 == 0,
+        "differing_s1_sample": diff_sample,
+    }
+
+
+def _cand_stats(cands: dict[str, set[str]], s1_ids: list[str]) -> dict:
+    """Mean/max candidates and total pairs over the *full* S1 universe.
+
+    Unlike ``evaluate.blocking_recall``'s own ``mean_candidates`` (which averages
+    only over the S1s present as keys in ``cands``), this averages over every S1 in
+    ``s1_ids`` -- an S1 with zero candidates counts as 0, matching
+    ``blocking.report_blocking_stats``' production semantics.
+    """
+    sizes = [len(cands.get(s, ())) for s in s1_ids]
+    return {
+        "mean_candidates": sum(sizes) / len(sizes) if sizes else 0.0,
+        "max_candidates": float(max(sizes)) if sizes else 0.0,
+        "n_pairs": sum(sizes),
+    }
+
+
+def _true_match_loss(
+    cands_a: dict[str, set[str]], cands_b: dict[str, set[str]],
+    truth: dict[str, list[str]], s1_ids: list[str],
+) -> tuple[int, int, float]:
+    """Count true (S1, match) pairs retrieved by ``a`` but lost by ``b``.
+
+    A "true match lost" is a ground-truth pair that side ``a`` (the reference/
+    current-precision side) actually retrieved as a candidate, but side ``b`` (the
+    lower-precision side) did not -- i.e. an actual retrieval regression, not merely
+    "a true pair blocking never found in the first place" (that is a pre-existing
+    blocking miss on *both* sides, already covered by each side's own ``pair_recall``,
+    and is deliberately not double-counted here). Returns ``(n_true_total,
+    n_true_lost, pct_true_lost)`` over every S1 in ``s1_ids`` that has at least one
+    true match; singletons (no true matches) contribute nothing to either count.
+    """
+    n_true_total = 0
+    n_true_lost = 0
+    for s in s1_ids:
+        true_matches = set(truth.get(s, ()))
+        if not true_matches:
+            continue
+        n_true_total += len(true_matches)
+        retrieved_a = true_matches & cands_a.get(s, set())
+        n_true_lost += len(retrieved_a - cands_b.get(s, set()))
+    pct_true_lost = (n_true_lost / n_true_total * 100.0) if n_true_total else 0.0
+    return n_true_total, n_true_lost, pct_true_lost
+
+
+def _prepare_for_dense_diagnostic(
+    sample: float, encoder: Encoder | None
+) -> tuple[dict, dict[str, list[str]], list[str]]:
+    """Shared E3/E4 setup: load + normalise + embed the sample exactly once.
+
+    Calls the existing, unmodified ``run_pipeline._load_train`` and
+    ``run_pipeline.prepare`` (``use_embeddings=True``) -- the same normalisation and
+    embedding-cache path production uses -- so both experiments compare candidate IDs
+    computed from the *same* normalised records and the *same* embeddings, per the
+    task's methodology ("same normalization... same embeddings"). Raises if
+    embeddings could not be produced, since both E3 and E4 are dense-retrieval-only
+    diagnostics with nothing to compare without them.
+    """
+    s1, s2, s3, truth = rp._load_train(sample)
+    prep = rp.prepare(s1, s2, s3, use_embeddings=True, encoder=encoder, use_cache=True)
+    if prep["emb"] is None:
+        raise RuntimeError("prepare() produced no embeddings; E3/E4 need use_embeddings=True")
+    s1_ids = list(prep["s1"][config.ID_COL])
+    return prep, truth, s1_ids
+
+
+# --- E3: dense-retrieval chunk-size equality ------------------------------------------
+
+def chunk_size_configs() -> dict[str, dict]:
+    """'current' (live production) and 'larger' chunk configurations for E3.
+
+    Every chunk-size knob affecting embedding generation or dense embedding retrieval
+    lives in ``config.py``: ``DENSE_QUERY_CHUNK``/``DENSE_INDEX_CHUNK`` (the query/
+    index block sizes ``blocking.dense_topk`` chunks the exact top-k search into) and
+    ``EMBEDDING_BATCH`` (the encoder's ``model.encode(batch_size=...)``). ``'larger'``
+    doubles each, derived from the live production values rather than invented
+    outright: doubling both ``DENSE_QUERY_CHUNK`` and ``DENSE_INDEX_CHUNK`` roughly
+    4x's a per-chunk similarity block's element count (query_chunk x index_chunk, see
+    ``blocking.dense_topk``'s docstring for that memory model) -- at the production
+    defaults (4096 x 262_144) that block is already sized to fit comfortably in a T4's
+    16GB VRAM in float16, so doubling both still leaves headroom for the embedding
+    model itself; doubling ``EMBEDDING_BATCH`` is the same fewer-larger-calls
+    reasoning for the encode() batch.
+
+    NOTE: ``run_chunk_equality`` only exercises ``query_chunk``/``index_chunk`` as the
+    experimental variable in its candidate-ID comparison -- per the task's own
+    methodology, the *same* precomputed embeddings are reused for both configurations
+    (E3 is not re-encoding text twice), so ``embedding_batch`` cannot itself change a
+    dense-retrieval candidate ID here even though it is a real chunk-size knob (it
+    would need its own, separate re-encoding comparison to test). It is still reported
+    on every row for completeness, per the task's "chunk sizes" output field.
+    """
+    return {
+        "current": {
+            "query_chunk": config.DENSE_QUERY_CHUNK,
+            "index_chunk": config.DENSE_INDEX_CHUNK,
+            "embedding_batch": config.EMBEDDING_BATCH,
+        },
+        "larger": {
+            "query_chunk": config.DENSE_QUERY_CHUNK * 2,
+            "index_chunk": config.DENSE_INDEX_CHUNK * 2,
+            "embedding_batch": config.EMBEDDING_BATCH * 2,
+        },
+    }
+
+
+def run_chunk_equality(sample: float = 0.0045, encoder: Encoder | None = None) -> dict:
+    """E3: exact dense-retrieval candidate-ID equality across chunk-size configurations.
+
+    For the same deterministic S1/S2/S3 sample, the same normalisation, the same
+    embeddings (computed once, reused by both sides), the same blocking K
+    (``config.K_EMBEDDING``) and the same country restriction (production
+    ``blocking.country_groups``), this runs ``blocking.dense_topk`` -- the exact
+    production dense-retrieval primitive, unmodified -- twice: once with the current
+    production ``(DENSE_QUERY_CHUNK, DENSE_INDEX_CHUNK)`` and once with
+    :func:`chunk_size_configs`'s ``'larger'`` values (explicit keyword arguments,
+    since ``dense_topk``'s own default arguments are bound to ``config.*`` once at
+    import time, so mutating ``config`` at runtime would not otherwise reach a call
+    that omits them). The candidate-ID sets produced by each side are then compared
+    for exact equality (:func:`_candidate_set_diff`), and each side's true-pair
+    recall, mean/max candidates and resource usage are reported alongside.
+
+    Never modifies ``config.DENSE_QUERY_CHUNK``/``DENSE_INDEX_CHUNK`` -- both values
+    are only ever passed as explicit ``query_chunk``/``index_chunk`` keyword
+    arguments into ``dense_topk`` calls local to this function.
+
+    Sets ``status`` to ``"PASS"`` if the two candidate-ID sets are byte-for-byte
+    identical; ``"FAIL"`` if they differ *and* the larger-chunk side's true-pair
+    recall is lower (an actual true match was lost, not just tie-breaking noise);
+    otherwise ``"INVESTIGATE"`` (candidate sets differ, but no true match was lost --
+    e.g. a tie at the k-th position broken differently by chunk boundary). This
+    function never declares a production change safe by itself; it only measures.
+
+    Writes ``artifacts/diagnostics/chunk_equality_<timestamp>.json`` (full report,
+    reproducibility fields, git commit, dataset hashes, env info) and a one-row
+    ``chunk_equality_<timestamp>.tsv`` summary. Returns the JSON-serialisable report
+    dict. Never touches ``output/``, ``run_pipeline.py`` or any ``config.py`` default.
+    """
+    prep, truth, s1_ids = _prepare_for_dense_diagnostic(sample, encoder)
+    n_other = len(prep["others"])
+    chunks = chunk_size_configs()
+    k = config.K_EMBEDDING
+    _log(f"E3 chunk equality: {len(s1_ids):,} S1 x {n_other:,} others "
+        f"(sample={sample}, k={k}), configs={chunks}")
+
+    sides: dict[str, dict] = {}
+    for name, cfg in chunks.items():
+        def topk(q, x, kk, qc=cfg["query_chunk"], ic=cfg["index_chunk"]):
+            """Production dense_topk, called with this side's explicit chunk sizes."""
+            return dense_topk(q, x, kk, query_chunk=qc, index_chunk=ic)
+        with diag.ResourceTracker() as rt:
+            cands = _dense_candidates_grouped(prep["s1"], prep["others"], prep["emb"], k, topk)
+        sides[name] = {
+            "cands": cands, "chunk_config": cfg,
+            "stats": _cand_stats(cands, s1_ids),
+            "recall": blocking_recall(cands, truth),
+            "resource": dict(rt.report),
+        }
+        _log(f"E3 chunk equality: '{name}' n_pairs={sides[name]['stats']['n_pairs']} "
+            f"pair_recall={sides[name]['recall']['pair_recall']:.4f} "
+            f"runtime={rt.report['runtime_s']:.2f}s")
+
+    diff = _candidate_set_diff(sides["current"]["cands"], sides["larger"]["cands"])
+    if diff["exact_equal"]:
+        status = "PASS"
+    elif sides["larger"]["recall"]["pair_recall"] < sides["current"]["recall"]["pair_recall"]:
+        status = "FAIL"
+    else:
+        status = "INVESTIGATE"
+
+    report = {
+        "kind": "chunk_equality", "status": status, "sample": sample,
+        "k_embedding": k, "block_within_country": config.BLOCK_WITHIN_COUNTRY,
+        "n_s1": len(s1_ids), "n_other": n_other,
+        "current": {k2: v for k2, v in sides["current"].items() if k2 != "cands"},
+        "larger": {k2: v for k2, v in sides["larger"].items() if k2 != "cands"},
+        "diff": diff,
+        "git_commit": rp._git_hash(),
+        "dataset_file_hashes": diag.dataset_file_hashes(config.TRAIN_FILES),
+        "env": diag.env_info(),
+    }
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    DIAG_DIR.mkdir(parents=True, exist_ok=True)
+    report["timestamp"] = ts
+    diag.save_json(report, DIAG_DIR / f"chunk_equality_{ts}.json")
+    summary = pd.DataFrame([{
+        "timestamp": ts, "status": status, "sample": sample, "n_s1": len(s1_ids),
+        "current_query_chunk": chunks["current"]["query_chunk"],
+        "current_index_chunk": chunks["current"]["index_chunk"],
+        "larger_query_chunk": chunks["larger"]["query_chunk"],
+        "larger_index_chunk": chunks["larger"]["index_chunk"],
+        "exact_equal": diff["exact_equal"], "n_s1_differing": diff["n_s1_differing"],
+        "n_missing_pairs": diff["n_missing_pairs"], "n_extra_pairs": diff["n_extra_pairs"],
+        "current_pair_recall": sides["current"]["recall"]["pair_recall"],
+        "larger_pair_recall": sides["larger"]["recall"]["pair_recall"],
+        "current_runtime_s": sides["current"]["resource"]["runtime_s"],
+        "larger_runtime_s": sides["larger"]["resource"]["runtime_s"],
+    }])
+    summary.to_csv(DIAG_DIR / f"chunk_equality_{ts}.tsv", sep="\t", index=False)
+    _log(f"E3 chunk equality: status={status} "
+        f"(n_s1_differing={diff['n_s1_differing']}, missing={diff['n_missing_pairs']}, "
+        f"extra={diff['n_extra_pairs']}); report written to "
+        f"{DIAG_DIR / f'chunk_equality_{ts}.json'}")
+    return report
+
+
+# --- E4: FP16 embedding-precision retrieval correctness -------------------------------
+
+def _dense_topk_with_dtype(
+    queries: np.ndarray, index: np.ndarray, k: int, compute_dtype: type,
+    query_chunk: int = config.DENSE_QUERY_CHUNK, index_chunk: int = config.DENSE_INDEX_CHUNK,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Diagnostic-only twin of ``blocking.dense_topk``'s CPU chunked top-k merge,
+    parametrised by the similarity-matmul dtype.
+
+    ``blocking.dense_topk``'s own CPU branch always upcasts both operands to
+    ``float32`` (``np.asarray(..., dtype=np.float32)``) before the matmul,
+    *regardless* of the input embeddings' own dtype -- ``blocking.compute_embeddings``
+    already stores them as float16 on disk, so on a CPU-only machine (no CUDA) simply
+    feeding float16 arrays into the real ``dense_topk`` would silently be re-upcast
+    and never actually exercise a float16 matmul. This function exists only so E4 can
+    measure what changes if that matmul itself runs at a lower precision: it
+    reproduces ``dense_topk``'s exact chunked running-top-k merge algorithm (the same
+    ``best_s``/``best_i`` running update, the same ``np.argpartition``-based per-chunk
+    and per-merge top-k selection, the same chunk loop structure) verbatim, with
+    ``compute_dtype`` substituted for the hard-coded ``np.float32`` upcast in the
+    similarity matmul. The merge/comparison bookkeeping (``best_s``/``best_i``) still
+    accumulates in float32 -- only the similarity *values themselves* are computed at
+    ``compute_dtype`` -- matching what an actual float16 matmul followed by a
+    float32-accumulated top-k merge would produce (this mirrors ``dense_topk``'s own
+    GPU branch, which does exactly this: a float16 matmul via
+    ``torch.float16``, then ``.float()`` before ``torch.topk``).
+
+    On hardware where ``dense_topk`` already runs on CUDA (float16 matmul via torch),
+    this twin's ``compute_dtype=np.float16`` result should closely match what
+    ``dense_topk`` itself already does there -- this function's real purpose is
+    making the float16-vs-float32 comparison possible on a CPU-only development
+    machine, where ``dense_topk`` otherwise always computes in float32. It is never
+    called anywhere outside ``run_fp16_retrieval`` and does not modify
+    ``blocking.py``.
+    """
+    nq, nx = len(queries), len(index)
+    k = min(k, nx)
+    if nq == 0 or k == 0:
+        e = np.array([], dtype=np.int64)
+        return e, e, np.array([], dtype=np.float32)
+    best_s = np.full((nq, k), -np.inf, dtype=np.float32)
+    best_i = np.full((nq, k), -1, dtype=np.int64)
+    for xs in range(0, nx, index_chunk):
+        xblock = np.asarray(index[xs:xs + index_chunk], dtype=compute_dtype)
+        kb = min(k, len(xblock))
+        for qs in range(0, nq, query_chunk):
+            qblock = np.asarray(queries[qs:qs + query_chunk], dtype=compute_dtype)
+            sims = (qblock @ xblock.T).astype(np.float32)
+            si = np.argpartition(-sims, kb - 1, axis=1)[:, :kb]
+            sv = np.take_along_axis(sims, si, axis=1)
+            si = si + xs
+            cat_s = np.concatenate([best_s[qs:qs + query_chunk], sv], axis=1)
+            cat_i = np.concatenate([best_i[qs:qs + query_chunk], si], axis=1)
+            top = np.argpartition(-cat_s, k - 1, axis=1)[:, :k]
+            best_s[qs:qs + query_chunk] = np.take_along_axis(cat_s, top, axis=1)
+            best_i[qs:qs + query_chunk] = np.take_along_axis(cat_i, top, axis=1)
+    rows = np.repeat(np.arange(nq), k)
+    flat_i, flat_s = best_i.ravel(), best_s.ravel()
+    ok = flat_i >= 0
+    return rows[ok], flat_i[ok], flat_s[ok]
+
+
+def run_fp16_retrieval(sample: float = 0.0045, encoder: Encoder | None = None) -> dict:
+    """E4: true-match retrieval loss from computing dense-retrieval similarity at
+    float16 instead of ``blocking.dense_topk``'s current per-hardware precision.
+
+    For the same deterministic sample, the same normalised records, the same model
+    weights/embeddings (computed once, reused by both sides), the same blocking K and
+    the same query/index chunk sizes, this compares two dense-retrieval candidate
+    sets: the current production path (``blocking.dense_topk`` called unmodified --
+    float32 matmul on CPU, float16 matmul on CUDA, whichever this machine already
+    does) against a forced-float16-matmul path (:func:`_dense_topk_with_dtype` with
+    ``compute_dtype=np.float16`` -- see that function's docstring for why a genuine
+    twin, not the real ``dense_topk``, is needed to exercise float16 on a CPU-only
+    machine).
+
+    Beyond the exact-equality diff (:func:`_candidate_set_diff`) and both sides'
+    blocking recall/candidate stats, this additionally counts **true matches lost**:
+    true (S1, match) pairs from the ground truth that the current-precision side
+    retrieved but the float16 side did not, and the percentage of all true matches in
+    scope that represents. Classifies the outcome as one of:
+
+    * ``"zero"`` -- the two candidate-ID sets are exactly identical.
+    * ``"tie_breaking_only"`` -- candidate sets differ, but zero true matches were
+      lost (the differences are all among non-matching candidates, or a tie at the
+      k-th position broken differently).
+    * ``"true_match_loss"`` -- at least one true match present under the current
+      precision path is absent under float16.
+
+    ``status`` is ``"PASS"`` for ``"zero"``, ``"INVESTIGATE"`` for
+    ``"tie_breaking_only"``, and ``"FAIL"`` for ``"true_match_loss"`` -- this function
+    never itself declares float16 safe for production; it only measures and reports.
+
+    Writes ``artifacts/diagnostics/fp16_retrieval_<timestamp>.json`` (full report,
+    reproducibility fields, git commit, dataset hashes, env info) and a one-row
+    ``fp16_retrieval_<timestamp>.tsv`` summary. Returns the JSON-serialisable report
+    dict. Never modifies embedding precision, chunk sizes or any other production
+    default -- ``_dense_topk_with_dtype`` is a diagnostic-only function called from
+    nowhere else, and ``blocking.py``/``config.py`` are untouched.
+    """
+    prep, truth, s1_ids = _prepare_for_dense_diagnostic(sample, encoder)
+    n_other = len(prep["others"])
+    k = config.K_EMBEDDING
+    qc, ic = config.DENSE_QUERY_CHUNK, config.DENSE_INDEX_CHUNK
+    _log(f"E4 fp16 retrieval: {len(s1_ids):,} S1 x {n_other:,} others "
+        f"(sample={sample}, k={k}, query_chunk={qc}, index_chunk={ic})")
+
+    with diag.ResourceTracker() as rt_current:
+        cands_current = _dense_candidates_grouped(
+            prep["s1"], prep["others"], prep["emb"], k,
+            lambda q, x, kk: dense_topk(q, x, kk, query_chunk=qc, index_chunk=ic))
+    with diag.ResourceTracker() as rt_fp16:
+        cands_fp16 = _dense_candidates_grouped(
+            prep["s1"], prep["others"], prep["emb"], k,
+            lambda q, x, kk: _dense_topk_with_dtype(q, x, kk, np.float16, qc, ic))
+
+    diff = _candidate_set_diff(cands_current, cands_fp16)
+    recall_current = blocking_recall(cands_current, truth)
+    recall_fp16 = blocking_recall(cands_fp16, truth)
+    stats_current = _cand_stats(cands_current, s1_ids)
+    stats_fp16 = _cand_stats(cands_fp16, s1_ids)
+
+    n_true_total, n_true_lost, pct_true_lost = _true_match_loss(
+        cands_current, cands_fp16, truth, s1_ids)
+
+    if n_true_lost > 0:
+        category, status = "true_match_loss", "FAIL"
+    elif not diff["exact_equal"]:
+        category, status = "tie_breaking_only", "INVESTIGATE"
+    else:
+        category, status = "zero", "PASS"
+
+    report = {
+        "kind": "fp16_retrieval", "status": status, "category": category,
+        "sample": sample, "k_embedding": k, "query_chunk": qc, "index_chunk": ic,
+        "block_within_country": config.BLOCK_WITHIN_COUNTRY,
+        "n_s1": len(s1_ids), "n_other": n_other,
+        "current": {"dtype": "float32/hardware-default", "stats": stats_current,
+                    "recall": recall_current, "resource": dict(rt_current.report)},
+        "fp16": {"dtype": "float16", "stats": stats_fp16,
+                "recall": recall_fp16, "resource": dict(rt_fp16.report)},
+        "diff": diff,
+        "n_true_matches_total": n_true_total,
+        "n_true_matches_lost": n_true_lost,
+        "pct_true_matches_lost": pct_true_lost,
+        "git_commit": rp._git_hash(),
+        "dataset_file_hashes": diag.dataset_file_hashes(config.TRAIN_FILES),
+        "env": diag.env_info(),
+    }
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    DIAG_DIR.mkdir(parents=True, exist_ok=True)
+    report["timestamp"] = ts
+    diag.save_json(report, DIAG_DIR / f"fp16_retrieval_{ts}.json")
+    summary = pd.DataFrame([{
+        "timestamp": ts, "status": status, "category": category, "sample": sample,
+        "n_s1": len(s1_ids), "exact_equal": diff["exact_equal"],
+        "n_s1_differing": diff["n_s1_differing"], "n_missing_pairs": diff["n_missing_pairs"],
+        "n_extra_pairs": diff["n_extra_pairs"],
+        "n_true_matches_total": n_true_total, "n_true_matches_lost": n_true_lost,
+        "pct_true_matches_lost": pct_true_lost,
+        "current_pair_recall": recall_current["pair_recall"],
+        "fp16_pair_recall": recall_fp16["pair_recall"],
+        "current_s1_full_recall": recall_current["s1_full_recall"],
+        "fp16_s1_full_recall": recall_fp16["s1_full_recall"],
+        "current_runtime_s": rt_current.report["runtime_s"],
+        "fp16_runtime_s": rt_fp16.report["runtime_s"],
+    }])
+    summary.to_csv(DIAG_DIR / f"fp16_retrieval_{ts}.tsv", sep="\t", index=False)
+    _log(f"E4 fp16 retrieval: status={status} category={category} "
+        f"(true matches lost={n_true_lost}/{n_true_total} = {pct_true_lost:.2f}%); "
+        f"report written to {DIAG_DIR / f'fp16_retrieval_{ts}.json'}")
+    return report
+
+
 # --- CLI ---------------------------------------------------------------------------------
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -754,6 +1208,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     kd.add_argument("--no-embeddings", action="store_true",
                     help="skip the embedding pass entirely")
 
+    ce = sub.add_parser(
+        "chunk-equality",
+        help="E3: exact dense-retrieval candidate-ID equality across chunk sizes")
+    ce.add_argument("--sample", type=float, default=0.0045,
+                    help="S1 sample fraction (default: 0.0045, the reproducible baseline scale)")
+
+    fp = sub.add_parser(
+        "fp16-retrieval",
+        help="E4: true-match retrieval loss from float16 dense-retrieval similarity")
+    fp.add_argument("--sample", type=float, default=0.0045,
+                    help="S1 sample fraction (default: 0.0045, the reproducible baseline scale)")
+
     return parser.parse_args(argv)
 
 
@@ -774,6 +1240,10 @@ def main(argv: list[str] | None = None) -> None:
         run_blocking_ablation(args.sample, not args.no_embeddings)
     elif args.command == "blocking-k-downstream":
         run_blocking_k_downstream(args.sample, not args.no_embeddings)
+    elif args.command == "chunk-equality":
+        run_chunk_equality(args.sample)
+    elif args.command == "fp16-retrieval":
+        run_fp16_retrieval(args.sample)
 
 
 if __name__ == "__main__":
