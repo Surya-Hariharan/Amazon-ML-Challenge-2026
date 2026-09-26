@@ -149,10 +149,24 @@ def test_cand_stats_averages_over_the_full_s1_universe_including_zero_candidates
 
 # --- 4. FP16 comparison logic (the diagnostic-only dtype twin) ---------------------------
 
-def test_dense_topk_with_dtype_float32_matches_production_dense_topk():
+def test_dense_topk_with_dtype_float32_matches_production_dense_topk(monkeypatch):
     """compute_dtype=np.float32 must reproduce blocking.dense_topk's own CPU result
     exactly -- the twin's algorithm is a verbatim copy of dense_topk's CPU branch, so
-    this is a correctness check on the twin itself, not just a sanity check."""
+    this is a correctness check on the twin itself, not just a sanity check.
+
+    ``_dense_topk_with_dtype`` only ever implements ``dense_topk``'s numpy CPU
+    branch (see its docstring) -- it has no torch/GPU code path at all. On a machine
+    where ``torch.cuda.is_available()`` is True, ``dense_topk`` itself silently takes
+    its *other* branch instead (a float16 matmul via torch, run on the GPU), which is
+    not what this twin reproduces and is expected to differ from a float32 CPU
+    computation by torch-float16-sized amounts -- exactly the ~1e-3-relative
+    discrepancy this test is guarding against, not a bug in the twin. Forcing
+    ``blocking._torch_device`` to report no CUDA device makes this a same-branch,
+    hardware-independent comparison (matching the twin's own, CPU-only, scope) so the
+    test is deterministic on both a CPU-only dev machine and a GPU-equipped
+    SageMaker instance.
+    """
+    monkeypatch.setattr(blocking, "_torch_device", lambda: None)
     rng = np.random.default_rng(0)
     q = l2(rng.normal(size=(11, 8)).astype(np.float32))
     x = l2(rng.normal(size=(17, 8)).astype(np.float32))
