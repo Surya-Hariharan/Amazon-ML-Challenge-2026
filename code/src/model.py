@@ -27,6 +27,15 @@ def _log(msg: str) -> None:
     print(f"[model {time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def _rss_mb() -> float:
+    """Current process resident memory in MiB, or NaN if psutil is unavailable."""
+    try:
+        import psutil
+        return psutil.Process().memory_info().rss / (1024 ** 2)
+    except Exception:
+        return float("nan")
+
+
 def group_folds(groups: pd.Series | np.ndarray, n_folds: int = config.N_FOLDS) -> np.ndarray:
     """Return a fold id per row such that every group sits in exactly one fold.
 
@@ -74,12 +83,16 @@ def train_oof(
     folds = group_folds(groups, n_folds)
     oof = np.zeros(len(X), dtype=np.float32)
     models: list[lgb.Booster] = []
+    if verbose:
+        _log(f"before train_oof: rss={_rss_mb():.0f}MiB")
     for f in range(int(folds.max()) + 1):
         tr, va = folds != f, folds == f
         if not tr.any():  # a single group: nothing to train on out-of-fold
             continue
         dtr = lgb.Dataset(X[tr], y[tr], free_raw_data=True)
         dva = lgb.Dataset(X[va], y[va], reference=dtr)
+        if verbose:
+            _log(f"fold {f}: before lgb.train rss={_rss_mb():.0f}MiB")
         model = lgb.train(params, dtr, num_boost_round=num_boost_round, valid_sets=[dva],
                           callbacks=[lgb.early_stopping(early_stopping, verbose=False)])
         oof[va] = model.predict(X[va], num_iteration=model.best_iteration)

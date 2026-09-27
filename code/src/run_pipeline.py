@@ -53,6 +53,15 @@ def _log(msg: str) -> None:
     print(f"[pipeline {time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def _rss_mb() -> float:
+    """Current process resident memory in MiB, or NaN if psutil is unavailable."""
+    try:
+        import psutil
+        return psutil.Process().memory_info().rss / (1024 ** 2)
+    except Exception:
+        return float("nan")
+
+
 # --- data preparation ----------------------------------------------------------------
 
 def truth_from_frame(gt: pd.DataFrame) -> dict[str, list[str]]:
@@ -343,8 +352,11 @@ def _fit_on_prepared(prep: dict, truth: dict[str, list[str]],
     metrics = {f"block_{k}": v for k, v in report_blocking_stats(
         cands_tr, truth, tr_ids, len(prep["others"]),
         dict(zip(tr_ids, prep["s1"][config.COUNTRY_COL]))).items()}
+    _log(f"before build_features: rss={_rss_mb():.0f}MiB")
     feats_tr = build_features(cands_tr, prep["s1"], prep["others"], prep["emb"])
+    _log(f"after build_features: rss={_rss_mb():.0f}MiB")
     feats_tr["label"] = label_pairs(feats_tr, truth)
+    _log(f"before fit_and_tune: rss={_rss_mb():.0f}MiB")
     fitted = fit_and_tune(feats_tr, truth, tr_ids)
     metrics.update(tau=fitted["tau"], singleton_tau=fitted["singleton_tau"],
                    oof_f05=fitted["oof_f05"])

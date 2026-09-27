@@ -15,7 +15,10 @@ Design inputs (CP1 audit):
   weapon against them.
 
 No country one-hots and no raw ID features (CLAUDE.md §2.4); ``same_country`` is the
-only country-derived feature. All work is chunked (``config.FEATURE_CHUNK`` pairs).
+only country-derived feature. Computation is chunked (``config.FEATURE_CHUNK`` pairs)
+and each chunk is written directly into a preallocated output buffer sized for the
+full pair count, so memory stays bounded by the final matrix size (~1x) rather than
+growing with the number of chunks retained in memory.
 """
 
 from __future__ import annotations
@@ -38,6 +41,15 @@ KEY_COLS = ["s1_id", "cand_id"]
 def _log(msg: str) -> None:
     """Print a timestamped progress line."""
     print(f"[features {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def _rss_mb() -> float:
+    """Current process resident memory in MiB, or NaN if psutil is unavailable."""
+    try:
+        import psutil
+        return psutil.Process().memory_info().rss / (1024 ** 2)
+    except Exception:
+        return float("nan")
 
 
 # --- fitted context ------------------------------------------------------------------
@@ -294,21 +306,45 @@ def build_features(
     i2 = pd.Index(others[config.ID_COL]).get_indexer(cands["cand_id"])
     if (i1 < 0).any() or (i2 < 0).any():
         raise ValueError("candidate IDs missing from the normalised frames")
-    parts = []
+
+    n = len(cands)
+    if verbose:
+        _log(f"before build_features: rss={_rss_mb():.0f}MiB")
+    # Each chunk is written into a preallocated buffer sized for the full pair
+    # count instead of being appended to a list, so peak memory is ~1x the final
+    # feature matrix rather than growing with the number of retained chunks.
+    buffers: dict[str, np.ndarray] | None = None
     t0 = time.time()
-    for start in range(0, len(cands), chunk):
-        a, b = i1[start:start + chunk], i2[start:start + chunk]
+    for start in range(0, n, chunk):
+        end = min(start + chunk, n)
+        a, b = i1[start:end], i2[start:end]
         r1 = s1.iloc[a].reset_index(drop=True)
         r2 = others.iloc[b].reset_index(drop=True)
         emb = (embeddings[0][a], embeddings[1][b]) if embeddings is not None else None
-        parts.append(pair_features(r1, r2, ctx, emb))
+        part = pair_features(r1, r2, ctx, emb)
+        if buffers is None:
+            buffers = {col: np.empty(n, dtype=np.float32) for col in part.columns}
+        for col in part.columns:
+            buffers[col][start:end] = part[col].to_numpy()
         if verbose:
-            _log(f"{min(start + chunk, len(cands)):,}/{len(cands):,} pairs "
-                 f"({time.time() - t0:.0f}s)")
-    feats = (pd.concat(parts, ignore_index=True) if parts
-             else pair_features(s1.iloc[:0], others.iloc[:0], ctx, None))
-    out = pd.concat([cands[KEY_COLS], feats, blocking_features(cands)], axis=1)
-    return context_features(out)
+            _log(f"{end:,}/{n:,} pairs ({time.time() - t0:.0f}s) rss={_rss_mb():.0f}MiB")
+    if buffers is None:
+        empty = pair_features(s1.iloc[:0], others.iloc[:0], ctx, None)
+        buffers = {col: np.empty(0, dtype=np.float32) for col in empty.columns}
+
+    if verbose:
+        _log(f"before assembling output frame: rss={_rss_mb():.0f}MiB")
+    bf = blocking_features(cands)
+    data = {KEY_COLS[0]: cands["s1_id"].to_numpy(), KEY_COLS[1]: cands["cand_id"].to_numpy()}
+    data.update(buffers)
+    data.update({col: bf[col].to_numpy() for col in bf.columns})
+    out = pd.DataFrame(data)
+    if verbose:
+        _log(f"after assembling output frame: rss={_rss_mb():.0f}MiB")
+    out = context_features(out)
+    if verbose:
+        _log(f"after context_features: rss={_rss_mb():.0f}MiB")
+    return out
 
 
 def label_pairs(pairs: pd.DataFrame, truth: dict[str, list[str]]) -> np.ndarray:
