@@ -45,9 +45,11 @@ def _frame(addr: str, digits: str, name: str = "acme traders", long_nums: str = 
 
 # --- D2 key schemes -------------------------------------------------------------------
 
-def test_all_digit_word_keys_use_every_digit_not_only_the_first():
-    """The production address key is anchored on the first digit token only; the
-    counterfactual scheme must also key on later digit tokens."""
+def test_all_digit_word_keys_use_every_digit_not_only_the_first(monkeypatch):
+    """The original (first-digit) address key misses later digit tokens; the
+    counterfactual scheme must also key on them."""
+    monkeypatch.setattr(config, "ADDRESS_KEY_MODE", "first")
+    monkeypatch.setattr(config, "BLOCK_DIGIT_SOURCE", "tokens")
     wdf = {"napean": 1, "sea": 5}
     a = diagnose._cf_scheme_keys("all_digit_word", _frame("12 napean sea", "12"), wdf, {})[0]
     b = diagnose._cf_scheme_keys("all_digit_word", _frame("145 12 napean sea", "145 12"), wdf, {})[0]
@@ -188,6 +190,22 @@ def test_density_variants_fraction_zero(train_files):
     assert b["union_pairs"] == len(base)
     assert c["union_recall_pct"] >= b["union_recall_pct"]
     assert "street_recall_pct" in out and "tfidf_addr_recall_pct" in out
+
+
+def test_blocking_memory_rows(train_files, monkeypatch):
+    """Per-pass rows cover every active pass per country, union rows report bytes per
+    unique pair. A fake encoder stands in for the model."""
+    from tests.test_blocking import fake_encoder
+    from src import blocking as B
+    monkeypatch.setattr(diagnose, "load_encoder", lambda: fake_encoder)
+    monkeypatch.setattr(B, "load_encoder", lambda: fake_encoder)
+    out = diagnose.run_blocking_memory(sample=1.0, variant="combined_k10", fraction=0.5,
+                                       union_pairs=(5_000,))
+    passes = out[out["kind"] == "pass"]
+    with diagnose.config_overrides(diagnose.FIX_VARIANTS["combined_k10"]):
+        expected = set(B.active_passes())
+    assert set(passes["pass"]) == expected
+    assert (out[out["kind"] == "union"]["pairs"] > 0).all()
 
 
 # --- D3 retrieval rank ----------------------------------------------------------------

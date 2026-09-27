@@ -341,6 +341,25 @@ def tfidf_name_pass(q_names: pd.Series, x_names: pd.Series, k: int = config.K_TF
     return pd.DataFrame({"q": q, "x": x, "score": s})
 
 
+class RowView:
+    """Lazy ``matrix[rows]``: supports ``len`` and slicing, gathering only the sliced
+    rows. Lets :func:`dense_topk` stream a country group's embeddings block by block
+    from the (memory-mapped) full matrix instead of materialising the whole group
+    (~7 GiB for a 5M-record group at 384 float32 dims)."""
+
+    def __init__(self, matrix: np.ndarray, rows: np.ndarray):
+        """Store the backing matrix and the row positions this view exposes."""
+        self.matrix, self.rows = matrix, rows
+
+    def __len__(self) -> int:
+        """Number of rows in the view."""
+        return len(self.rows)
+
+    def __getitem__(self, sl: slice) -> np.ndarray:
+        """Gather the rows selected by ``sl`` (float32, in memory)."""
+        return np.asarray(self.matrix[self.rows[sl]], dtype=np.float32)
+
+
 def embedding_pass(q_emb: np.ndarray, x_emb: np.ndarray, k: int = config.K_EMBEDDING
                    ) -> pd.DataFrame:
     """Pass 2: dense embedding cosine top-k per query."""
@@ -590,7 +609,7 @@ def generate_candidates(
         }
         if embeddings is not None:
             runs["embed"] = lambda: embedding_pass(
-                np.asarray(embeddings[0][q_idx]), np.asarray(embeddings[1][x_idx]),
+                RowView(embeddings[0], q_idx), RowView(embeddings[1], x_idx),
                 k=ko.get("embed", config.K_EMBEDDING))
         if use_address_pass:
             runs["address"] = lambda: address_pass(q, x, k=ko.get("address", config.K_ADDRESS))
@@ -615,6 +634,18 @@ def generate_candidates(
         if verbose:
             _log(f"{country}: {len(q_idx):,} S1 x {len(x_idx):,} others in "
                  f"{time.time() - t0:.1f}s")
+    return union_pass_frames(frames, s1[config.ID_COL].to_numpy(),
+                             others[config.ID_COL].to_numpy())
+
+
+def union_pass_frames(frames: list[pd.DataFrame], s1_ids: np.ndarray,
+                      other_ids: np.ndarray) -> pd.DataFrame:
+    """De-duplicated union of per-pass results (``q``, ``x``, ``bit``, ``score_<pass>``)
+    into the candidate frame: one row per (S1, candidate) with the OR of pass bits and
+    each pass's score (NaN when that pass did not return the pair). ``s1_ids`` /
+    ``other_ids`` map ``q`` / ``x`` positions to IDs. Factored out of
+    :func:`generate_candidates` so the union's memory can be measured on its own.
+    """
     score_cols = [f"score_{p}" for p in active_passes()]
     cols = ["s1_id", "cand_id", "passes"] + score_cols
     if not frames:
@@ -631,8 +662,8 @@ def generate_candidates(
     agg = {"bit": "sum", **{c: "max" for c in score_cols}}
     out = allp.groupby(["q", "x"], sort=True).agg(agg).reset_index()
     out = out.rename(columns={"bit": "passes"}).astype({"passes": np.uint8})
-    out.insert(0, "s1_id", s1[config.ID_COL].to_numpy()[out["q"].to_numpy()])
-    out.insert(1, "cand_id", others[config.ID_COL].to_numpy()[out["x"].to_numpy()])
+    out.insert(0, "s1_id", s1_ids[out["q"].to_numpy()])
+    out.insert(1, "cand_id", other_ids[out["x"].to_numpy()])
     out[score_cols] = out[score_cols].astype(np.float32)
     return out[cols].reset_index(drop=True)
 

@@ -137,7 +137,7 @@ ADDRESS_MAX_BLOCK = 100
 #: "all": ``digit@word`` for each of the first ``ADDRESS_MAX_DIGITS`` digit tokens, so
 #: sources that order/prefix house numbers differently ("12" vs "145 12") still share
 #: a key (diagnostic D2: first-digit anchoring gave 79/80 strong-address FNs no key).
-ADDRESS_KEY_MODE = "first"
+ADDRESS_KEY_MODE = "all"
 ADDRESS_MAX_DIGITS = 4
 
 #: Digit tokens the key passes (digit, address) block on. "tokens": the normalised
@@ -145,11 +145,11 @@ ADDRESS_MAX_DIGITS = 4
 #: ``addr_norm`` token, so "24637b", "f 45d", "a26" keep their numbers (D6b: ~12% of
 #: India records lose a digit run). Blocking-only: normalised fields and matcher
 #: features are unchanged.
-BLOCK_DIGIT_SOURCE = "tokens"
+BLOCK_DIGIT_SOURCE = "runs"
 
 #: Pass 6 — street-word pairs: unordered pairs of a record's rarest alphabetic
 #: address words, no digit required (digit-less addresses get no address-pass key).
-USE_STREET_PASS = False
+USE_STREET_PASS = True
 K_STREET = 10
 STREET_MAX_BLOCK = 100
 STREET_WORDS = 3
@@ -157,8 +157,10 @@ STREET_WORDS = 3
 #: Pass 7 — char 3-4-gram TF-IDF on ``name_core + " " + addr_norm``. Separate from the
 #: name pass (which is unchanged): name-only retrieval degrades with index density
 #: and misses transliterated names whose address matches (D3/D4).
-USE_TFIDF_ADDR_PASS = False
-K_TFIDF_ADDR = 20
+USE_TFIDF_ADDR_PASS = True
+#: 10 not 20: at 10% index density recall 97.82% vs 97.95% for 14% fewer pairs; memory
+#: (~1 KB/train pair) is the binding full-scale constraint.
+K_TFIDF_ADDR = 10
 #: Optional index-side pruning to the N highest-weight n-grams per record (bounds the
 #: index matrix at full scale); None keeps every n-gram.
 TFIDF_ADDR_INDEX_TERMS = None
@@ -169,7 +171,7 @@ KEY_PASS_CHUNK = 50_000
 # --- Features (CP4) ----------------------------------------------------------------
 
 #: Pairs per feature chunk (bounds peak memory of string features).
-FEATURE_CHUNK = 1_000_000
+FEATURE_CHUNK = 250_000
 #: Records sampled to fit the feature TF-IDF vocabularies / IDF.
 FEATURE_TFIDF_FIT_SAMPLE = 2_000_000
 

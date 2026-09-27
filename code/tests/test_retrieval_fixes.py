@@ -75,8 +75,10 @@ def test_address_keys_all_mode_shares_later_digits(monkeypatch):
     assert "12@napean" in set(a) & set(b)
 
 
-def test_address_keys_first_mode_matches_original_definition():
+def test_address_keys_first_mode_matches_original_definition(monkeypatch):
     """First mode keeps the original keys: digit pair + first digit @ 2 rarest words."""
+    monkeypatch.setattr(config, "ADDRESS_KEY_MODE", "first")
+    monkeypatch.setattr(config, "BLOCK_DIGIT_SOURCE", "tokens")
     f = _addr_frame(["7 3 main bazaar kotwali"], ["7 3"])
     keys = blocking._address_keys(f, {"bazaar": 2, "kotwali": 1})[0]
     assert keys == ["7#3", "7@kotwali", "7@bazaar"]
@@ -116,8 +118,11 @@ def test_key_pass_hashed_join_matches_string_join():
 
 # --- pass wiring -----------------------------------------------------------------------
 
-def test_flags_off_keep_the_original_five_pass_schema(synth):
+def test_flags_off_keep_the_original_five_pass_schema(synth, monkeypatch):
     """With every new flag off, candidates and features carry only the base passes."""
+    for flag, val in (("USE_STREET_PASS", False), ("USE_TFIDF_ADDR_PASS", False),
+                      ("ADDRESS_KEY_MODE", "first"), ("BLOCK_DIGIT_SOURCE", "tokens")):
+        monkeypatch.setattr(config, flag, val)
     s1n, others, _ = synth
     cands = blocking.generate_candidates(s1n, others, verbose=False)
     assert [c for c in cands.columns if c.startswith("score_")] == \
@@ -130,6 +135,9 @@ def test_new_passes_add_bits_scores_and_features(synth, monkeypatch):
     """Enabled passes get their own bit, score column and in_/block_ features, and the
     union only grows."""
     s1n, others, truth = synth
+    for flag, val in (("USE_STREET_PASS", False), ("USE_TFIDF_ADDR_PASS", False),
+                      ("ADDRESS_KEY_MODE", "first"), ("BLOCK_DIGIT_SOURCE", "tokens")):
+        monkeypatch.setattr(config, flag, val)
     base = blocking.generate_candidates(s1n, others, verbose=False)
     for flag, val in (("USE_STREET_PASS", True), ("USE_TFIDF_ADDR_PASS", True),
                       ("ADDRESS_KEY_MODE", "all"), ("BLOCK_DIGIT_SOURCE", "runs")):
@@ -158,6 +166,20 @@ def test_tfidf_addr_index_pruning_bounds_index_terms(synth, monkeypatch):
     q, x = s1n.reset_index(drop=True), others.reset_index(drop=True)
     res = blocking.tfidf_addr_pass(q, x, k=5)
     assert len(res) > 0 and res.groupby("q").size().max() <= 5
+
+
+def test_union_pass_frames_ors_bits_and_keeps_scores():
+    """A pair returned by two passes gets both bits and both scores; others NaN."""
+    frames = [pd.DataFrame({"q": [0, 1], "x": [5, 6], "bit": np.uint8([1, 1]),
+                            "score_tfidf": np.float32([0.9, 0.8])}),
+              pd.DataFrame({"q": [0], "x": [5], "bit": np.uint8([4]),
+                            "score_rare": np.float32([2.0])})]
+    out = blocking.union_pass_frames(frames, np.array(["S1-a", "S1-b"], dtype=object),
+                                     np.array([f"S2-{i}" for i in range(7)], dtype=object))
+    assert list(out["s1_id"]) == ["S1-a", "S1-b"] and list(out["cand_id"]) == ["S2-5", "S2-6"]
+    assert list(out["passes"]) == [5, 1]
+    assert out.loc[0, "score_rare"] == 2.0 and np.isnan(out.loc[1, "score_rare"])
+    assert np.isnan(out.loc[0, "score_embed"])
 
 
 # --- D. memory: features ---------------------------------------------------------------
@@ -189,6 +211,19 @@ def test_build_features_chunking_and_no_copy_assembly(synth):
 
 
 # --- D. memory: embeddings -------------------------------------------------------------
+
+def test_row_view_dense_topk_equals_materialised_group():
+    """Streaming a group's embeddings through RowView gives exactly the same top-k as
+    materialising the group first."""
+    rng = np.random.default_rng(2)
+    m = rng.standard_normal((300, 8)).astype(np.float32)
+    m /= np.linalg.norm(m, axis=1, keepdims=True)
+    q_rows, x_rows = rng.choice(300, 40, replace=False), rng.choice(300, 200, replace=False)
+    a = blocking.dense_topk(m[q_rows], m[x_rows], 5, query_chunk=7, index_chunk=33)
+    b = blocking.dense_topk(blocking.RowView(m, q_rows), blocking.RowView(m, x_rows), 5,
+                            query_chunk=7, index_chunk=33)
+    for u, v in zip(a, b):
+        assert np.array_equal(u, v)
 
 def test_compute_embeddings_chunked_cache_equals_uncached(synth, monkeypatch):
     """Chunked encoding + memmap cache returns exactly the uncached vectors, leaves no

@@ -54,7 +54,7 @@ from . import run_pipeline as rp
 from .blocking import (_ADDRESS_STOPWORDS, PASS_BITS, _address_keys, active_passes, address_pass,
                        compute_embeddings, country_groups, dense_topk,
                        digit_token_pass, embedding_pass, embedding_text, generate_candidates,
-                       key_pass, load_encoder, prune_rows,
+                       key_pass, load_encoder, prune_rows, RowView,
                        rare_token_pass, report_blocking_stats, tfidf_name_pass)
 from .decide import apply_threshold, assign_one_to_one, tune_threshold
 from .evaluate import blocking_recall, score_report
@@ -3862,6 +3862,106 @@ def run_density_variants(sample: float = 0.0045, fractions: tuple[float, ...] = 
     return out
 
 
+def run_blocking_memory(sample: float = 0.0045, variant: str = "combined_k20",
+                        fraction: float = 0.1,
+                        union_pairs: tuple[int, ...] = (2_000_000, 6_000_000)) -> pd.DataFrame:
+    """Blocking-stage memory/time for a :data:`FIX_VARIANTS` configuration.
+
+    * ``pass`` rows: each production pass function run on its own per country group
+      at ``fraction`` density (the ``density-variants`` index, cached distractor
+      embeddings), wrapped in :class:`_PeakSampler`; ``scale_to_full`` is the full-scale
+      group size over this group's index size (from the full normalisation caches),
+      for linear extrapolation of index-proportional costs.
+    * ``union`` rows: production :func:`blocking.union_pass_frames` on synthetic per-pass
+      frames whose pass mix (rows per unique pair, per-pass shares) is taken from the
+      real run at ``fraction``, at each ``union_pairs`` size -> bytes per unique pair.
+
+    Writes ``blocking_memory_<ts>.tsv`` + ``.json`` under ``artifacts/diagnostics/``.
+    """
+    import pyarrow.parquet as pq
+    from .blocking import (digit_token_pass, rare_token_pass, street_pass, tfidf_addr_pass,
+                           union_pass_frames)
+    s1, s2, s3, truth = rp._load_train(sample)
+    prep = rp.prepare(s1, s2, s3, True)
+    del s1, s2, s3
+    s1f, base = prep["s1"].reset_index(drop=True), prep["others"].reset_index(drop=True)
+    extra = _distractors(fraction, set(base[config.ID_COL]), list(base.columns))
+    others = pd.concat([base, extra[base.columns]], ignore_index=True)
+    xe = (_distractor_embeddings(extra, fraction, load_encoder()) if len(extra)
+          else np.empty((0, np.asarray(prep["emb"][1]).shape[1]), np.float32))
+    emb = (np.asarray(prep["emb"][0]), np.concatenate([np.asarray(prep["emb"][1]), xe]))
+    del xe, extra
+    full_counts: dict[str, int] = {}
+    for name in ("s2", "s3"):
+        for c, n in pq.read_table(_full_norm_cache(name), columns=[config.COUNTRY_COL]
+                                  ).column(0).to_pandas().value_counts().items():
+            full_counts[c] = full_counts.get(c, 0) + int(n)
+    rows, pass_rows = [], {}
+    with config_overrides(FIX_VARIANTS[variant]):
+        for country, q_idx, x_idx in country_groups(s1f, others, config.BLOCK_WITHIN_COUNTRY):
+            q, x = s1f.iloc[q_idx].reset_index(drop=True), others.iloc[x_idx].reset_index(drop=True)
+            runs = {
+                "tfidf": lambda: tfidf_name_pass(q["name_core"], x["name_core"]),
+                "embed": lambda: embedding_pass(RowView(emb[0], q_idx), RowView(emb[1], x_idx)),
+                "rare": lambda: rare_token_pass(q, x),
+                "digit": lambda: digit_token_pass(q, x),
+                "address": lambda: address_pass(q, x),
+            }
+            if config.USE_STREET_PASS:
+                runs["street"] = lambda: street_pass(q, x)
+            if config.USE_TFIDF_ADDR_PASS:
+                runs["tfidf_addr"] = lambda: tfidf_addr_pass(q, x)
+            for name, run in runs.items():
+                t0 = time.time()
+                with _PeakSampler() as m:
+                    res = run()
+                pass_rows[name] = pass_rows.get(name, 0) + len(res)
+                rows.append({"kind": "pass", "country": country, "pass": name,
+                             "n_queries": len(q_idx), "index_records": len(x_idx),
+                             "scale_to_full": full_counts.get(country, 0) / max(len(x_idx), 1),
+                             "pairs": len(res), "seconds": round(time.time() - t0, 1),
+                             "peak_over_start_gib": m.peak - m.start})
+                _log(f"blocking memory {country} {name}: +{m.peak - m.start:.2f} GiB, "
+                     f"{rows[-1]['seconds']}s")
+                del res
+        cands = generate_candidates(s1f, others, embeddings=emb, verbose=False)
+        mix = {p: pass_rows[p] / len(cands) for p in pass_rows}  # rows per unique pair
+        del cands, emb, others
+        rng = np.random.default_rng(config.SEED)
+        for n in union_pairs:
+            nq, nx = max(n // 50, 1), 10_000_000
+            q_all = np.repeat(np.arange(nq, dtype=np.int64), 50)[:n]
+            x_all = rng.integers(0, nx, n, dtype=np.int64)
+            frames = []
+            for p, share in mix.items():
+                sel = rng.random(n) < min(share, 1.0)
+                frames.append(pd.DataFrame({"q": q_all[sel], "x": x_all[sel],
+                                            "bit": np.full(int(sel.sum()), PASS_BITS[p], np.uint8),
+                                            f"score_{p}": rng.random(int(sel.sum()), np.float32)}))
+            s1_ids = np.array([f"S1-{i}" for i in range(nq)], dtype=object)
+            other_ids = np.array([f"S2-{i}" for i in range(nx)], dtype=object)
+            n_rows = sum(len(f) for f in frames)
+            with _PeakSampler() as m:
+                out = union_pass_frames(frames, s1_ids, other_ids)
+            rows.append({"kind": "union", "pairs": len(out), "input_rows": n_rows,
+                         "peak_over_start_gib": m.peak - m.start,
+                         "end_delta_gib": m.end - m.start,
+                         "bytes_per_unique_pair": (m.peak - m.start) * 2 ** 30 / max(len(out), 1)})
+            _log(f"blocking memory union {len(out):,} pairs ({n_rows:,} rows): "
+                 f"+{m.peak - m.start:.2f} GiB")
+            del frames, out, s1_ids, other_ids, q_all, x_all
+    out = pd.DataFrame(rows)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    DIAG_DIR.mkdir(parents=True, exist_ok=True)
+    out.to_csv(DIAG_DIR / f"blocking_memory_{ts}.tsv", sep="\t", index=False)
+    diag.save_json({"kind": "blocking_memory", "timestamp": ts, "sample": sample,
+                    "variant": variant, "fraction": fraction, "pass_mix": mix,
+                    "full_group_sizes": full_counts, "git_commit": rp._git_hash(),
+                    "env": diag.env_info()}, DIAG_DIR / f"blocking_memory_{ts}.json")
+    print(out.to_string(index=False))
+    return out
+
+
 def _old_compute_embeddings(frame: pd.DataFrame, encoder) -> np.ndarray:
     """The pre-fix ``compute_embeddings`` body (no cache), kept only so
     ``memory-budget`` can measure the old peak against the new chunked path."""
@@ -4428,6 +4528,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                      help="also measure name+address TF-IDF and D2's best key schemes")
     ds_.add_argument("--no-embeddings", action="store_true")
 
+    bm = sub.add_parser(
+        "blocking-memory",
+        help="per-pass and union memory/time of a fix configuration, scaled to full size")
+    bm.add_argument("--sample", type=float, default=0.0045,
+                    help="S1 sample fraction (default: 0.0045, the reproducible baseline scale)")
+    bm.add_argument("--variant", default="combined_k20", choices=list(FIX_VARIANTS))
+    bm.add_argument("--fraction", type=float, default=0.1)
+
     mb = sub.add_parser(
         "memory-budget",
         help="measured per-pair memory of features/model/embeddings for a fix configuration")
@@ -4518,6 +4626,8 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "density-stress":
         run_density_stress(args.sample, tuple(args.fractions), not args.no_embeddings,
                            args.max_rss_gib, args.counterfactuals)
+    elif args.command == "blocking-memory":
+        run_blocking_memory(args.sample, args.variant, args.fraction)
     elif args.command == "memory-budget":
         run_memory_budget(args.sample, args.variant)
     elif args.command == "density-variants":

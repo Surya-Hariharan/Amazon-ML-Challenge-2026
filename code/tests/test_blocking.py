@@ -248,6 +248,8 @@ def test_generate_candidates_k_overrides_reaches_the_pass_function(monkeypatch):
         return blocking._empty_pass()
 
     monkeypatch.setattr(blocking, "tfidf_name_pass", spy_tfidf)
+    # the name+address pass also routes through tfidf_name_pass; keep this about pass 1
+    monkeypatch.setattr(config, "USE_TFIDF_ADDR_PASS", False)
     generate_candidates(s1, x, embeddings=None, use_address_pass=False, verbose=False,
                         k_overrides={"tfidf": 7})
     assert seen_k["tfidf"] == 7
