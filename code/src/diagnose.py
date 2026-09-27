@@ -24,6 +24,7 @@ Usage (from code/business_entity_resolution/)::
     python -m src.diagnose decision-validation [--sample 0.0045] [--no-embeddings]
     python -m src.diagnose loco [--sample 0.0045] [--no-embeddings]
     python -m src.diagnose feature-hard-negative [--sample 0.0045] [--no-embeddings]
+    python -m src.diagnose blocking-fn-attribution [--sample 0.0045] [--no-embeddings]
 
 Every subcommand is measurement-only: none of them changes ``output/``, and
 none of them is wired to run automatically -- each is a separate, explicit CLI
@@ -45,7 +46,9 @@ from . import diagnostics as diag
 from . import drift as drift_mod
 from . import error_decomposition as edecomp
 from . import run_pipeline as rp
-from .blocking import country_groups, dense_topk, generate_candidates, report_blocking_stats
+from .blocking import (address_pass, country_groups, dense_topk, digit_token_pass,
+                       embedding_pass, generate_candidates, rare_token_pass,
+                       report_blocking_stats, tfidf_name_pass)
 from .decide import apply_threshold, assign_one_to_one, tune_threshold
 from .evaluate import blocking_recall, score_report
 from .features import FeatureContext, build_features, feature_columns, label_pairs
@@ -2232,6 +2235,268 @@ def run_feature_hard_negative_audit(sample: float = 0.0045,
     return report
 
 
+# --- blocking-FN pass attribution ---------------------------------------------------------
+
+#: The five production blocking passes, in the order the CLI reports them.
+_PASS_NAMES = ("tfidf", "embed", "rare", "digit", "address")
+
+#: Every ``blocker_status`` value the report can emit, in output order.
+_STATUS_ORDER = ("NONE", "TFIDF_ONLY", "EMBED_ONLY", "RARE_ONLY", "DIGIT_ONLY",
+                 "ADDRESS_ONLY", "MULTIPLE")
+
+
+def _blocking_passes_by_country(
+    s1: pd.DataFrame, others: pd.DataFrame,
+    embeddings: tuple[np.ndarray, np.ndarray] | None,
+    within_country: bool = config.BLOCK_WITHIN_COUNTRY,
+    use_address_pass: bool = config.USE_ADDRESS_PASS,
+) -> dict[str, dict[str, set[str]]]:
+    """Run every individual production blocking pass, per country group, at its
+    production ``config.K_*`` default -- i.e. exactly the per-group ``runs`` dict
+    ``blocking.generate_candidates`` itself builds and calls, unmodified, except that
+    each pass's own output is kept separate here instead of being folded into the
+    bitmask union ``generate_candidates`` returns. Uses the same
+    ``blocking.country_groups`` grouping production blocking uses, so which S1/
+    candidate pairs are even eligible for a given pass is identical to production.
+
+    Returns ``{pass_name: {s1_id: {cand_id, ...}}}`` -- ``"embed"`` is omitted
+    entirely when ``embeddings`` is ``None`` and ``"address"`` when
+    ``use_address_pass`` is ``False``, exactly mirroring which passes
+    ``generate_candidates`` itself would have run.
+    """
+    s1 = s1.reset_index(drop=True)
+    others = others.reset_index(drop=True)
+    s1_ids_all = s1[config.ID_COL].to_numpy()
+    cand_ids_all = others[config.ID_COL].to_numpy()
+    out: dict[str, dict[str, set[str]]] = {
+        name: {} for name in _PASS_NAMES
+        if (name != "embed" or embeddings is not None) and (name != "address" or use_address_pass)
+    }
+    for _country, q_idx, x_idx in country_groups(s1, others, within_country):
+        if len(x_idx) == 0:
+            continue
+        q = s1.iloc[q_idx].reset_index(drop=True)
+        x = others.iloc[x_idx].reset_index(drop=True)
+        runs = {
+            "tfidf": lambda: tfidf_name_pass(q["name_core"], x["name_core"], k=config.K_TFIDF_NAME),
+            "rare": lambda: rare_token_pass(q, x, k=config.K_RARE_TOKEN),
+            "digit": lambda: digit_token_pass(q, x, k=config.K_POSTAL_TOKEN),
+        }
+        if embeddings is not None:
+            runs["embed"] = lambda: embedding_pass(
+                np.asarray(embeddings[0][q_idx]), np.asarray(embeddings[1][x_idx]),
+                k=config.K_EMBEDDING)
+        if use_address_pass:
+            runs["address"] = lambda: address_pass(q, x, k=config.K_ADDRESS)
+        for name, run in runs.items():
+            res = run()
+            if len(res) == 0:
+                continue
+            s1g = s1_ids_all[q_idx[res["q"].to_numpy()]]
+            candg = cand_ids_all[x_idx[res["x"].to_numpy()]]
+            bucket = out[name]
+            for sid, cid in zip(s1g, candg):
+                bucket.setdefault(sid, set()).add(cid)
+    return out
+
+
+def run_blocking_fn_attribution(sample: float = 0.0045,
+                                use_embeddings: bool = True) -> dict:
+    """Measurement-only diagnostic: attribute each "clean" blocking false negative --
+    a true (S1, candidate) pair that ``error_decomposition.classify_true_pairs``
+    stages as ``blocking_false_negative`` (absent from the final production candidate
+    union) with every one of :data:`error_decomposition.LOSS_KEYS`'s six
+    representation-loss flags False -- to whichever individual production blocking
+    pass(es), if any, would retrieve it on their own, at production default K.
+
+    A true pair the production candidate union missed is, by construction, missed by
+    *every* individual pass at that same production K: the union IS the union of the
+    five passes' own outputs (``blocking.generate_candidates``'s ``runs`` dict), so
+    this diagnostic is not expected to surface true-match recall production silently
+    discarded. Its actual purpose is a consistency check on the union construction
+    itself -- if a "clean" blocking false negative here IS retrieved by an individual
+    pass re-run, that is a genuine discrepancy between the individual pass and the
+    production union path (sanity check 2 below), worth flagging, not something this
+    function papers over or asserts away.
+
+    Reuses, unmodified: ``run_pipeline._load_train``/:func:`run_valid_for_diagnostics`
+    (the same deterministic sample, normalisation, embeddings, train/valid split,
+    production-default blocking union and OOF-tuned decision the ``errors``/
+    ``feature-hard-negative`` diagnostics already use),
+    ``error_decomposition.classify_true_pairs`` (the same stage classification and
+    representation-loss flags), and every one of ``blocking``'s five pass functions
+    plus ``blocking.country_groups`` (via :func:`_blocking_passes_by_country`), each
+    called at its production ``config.K_*`` default -- never approximated or
+    reimplemented.
+
+    Note on the five representation-loss keys named in the task vs.
+    ``error_decomposition.LOSS_KEYS``: the task's five named flags
+    (``postal_or_long_num_lost``, ``house_number_lost``, ``name_token_lost``,
+    ``address_token_lost``, ``other_normalization_loss``) omit
+    ``script_info_lost``, but its own sanity check asks this function to assert
+    "all six representation-loss flags False" -- ``LOSS_KEYS`` has exactly six
+    entries. This function follows the six-flag (stricter, superset) selection
+    so both statements in the task are simultaneously satisfiable: every row this
+    function selects has every flag in ``LOSS_KEYS``, ``script_info_lost``
+    included, False.
+
+    Writes ``clean_blocking_fn_attribution.tsv`` (one row per clean blocking FN) and
+    ``summary.tsv`` under ``artifacts/diagnostics/blocking_fn_attribution_<ts>/``
+    (plus a ``meta.json`` sidecar, mirroring this module's other diagnostics). Never
+    touches ``output/``, never changes a ``config.py`` default, and never re-tunes or
+    re-fits anything beyond what :func:`run_valid_for_diagnostics` already does.
+    """
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    out_dir = DIAG_DIR / f"blocking_fn_attribution_{ts}"
+    _log(f"blocking FN attribution: sample={sample}")
+
+    s1, s2, s3, truth = rp._load_train(sample)
+    ctx = run_valid_for_diagnostics(s1, s2, s3, truth, use_embeddings)
+    prep, cands, scored, pred, tau = ctx["prep"], ctx["cands"], ctx["scored"], ctx["pred"], ctx["tau"]
+    valid_truth = {s: truth.get(s, []) for s in ctx["valid_ids"]}
+    s1_country = dict(zip(prep["s1"][config.ID_COL], prep["s1"][config.COUNTRY_COL]))
+
+    classified = edecomp.classify_true_pairs(
+        prep["s1"], prep["others"], cands, scored, pred, valid_truth, tau)
+
+    loss_cols = list(edecomp.LOSS_KEYS)
+    is_bfn = classified["stage"] == "blocking_false_negative"
+    no_loss = ~classified[loss_cols].any(axis=1) if len(classified) else pd.Series(dtype=bool)
+    clean = classified[is_bfn & no_loss].reset_index(drop=True)
+    # Sanity check 4: every selected pair must have all six representation-loss
+    # flags False -- guaranteed by the filter above; asserted explicitly so a future
+    # edit to that filter can never silently include a representation-failure row.
+    assert not clean[loss_cols].any().any(), \
+        "clean blocking FN selection must have every representation-loss flag False"
+
+    # Sanity check 1: every clean FN pair must be absent from the exact candidate
+    # union `classify_true_pairs` itself checked against to assign the
+    # "blocking_false_negative" stage in the first place.
+    cand_key = set(zip(cands["s1_id"], cands["cand_id"]))
+    still_in_union = any((s, c) in cand_key for s, c in zip(clean["s1_id"], clean["cand_id"]))
+    assert not still_in_union, \
+        "clean blocking FN pairs must be absent from the final baseline candidate union"
+
+    _log(f"blocking FN attribution: {len(clean)} clean blocking FNs "
+        f"(stage=blocking_false_negative, all {len(loss_cols)} representation-loss flags False)")
+
+    DIAG_DIR.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    detail_path = out_dir / "clean_blocking_fn_attribution.tsv"
+    summary_path = out_dir / "summary.tsv"
+
+    if len(clean) == 0:
+        _log("blocking FN attribution: no clean blocking FNs in this sample -- nothing to attribute")
+        detail = pd.DataFrame(columns=[
+            "s1_id", "cand_id", "country", "retrieved_tfidf", "retrieved_embed",
+            "retrieved_rare", "retrieved_digit", "retrieved_address",
+            "n_blockers_retrieved", "blocker_status"])
+        summary = pd.DataFrame([
+            {"metric": "total_clean_blocking_fns", "value": 0},
+            {"metric": "retrieved_by_at_least_one_blocker", "value": 0},
+            {"metric": "retrieved_by_no_blocker", "value": 0},
+        ])
+        detail.to_csv(detail_path, sep="\t", index=False)
+        summary.to_csv(summary_path, sep="\t", index=False)
+        return {"detail": detail, "summary": summary, "out_dir": str(out_dir)}
+
+    pass_maps = _blocking_passes_by_country(
+        prep["s1"], prep["others"], prep["emb"],
+        within_country=config.BLOCK_WITHIN_COUNTRY, use_address_pass=config.USE_ADDRESS_PASS)
+
+    rows = []
+    for s1_id, cand_id in zip(clean["s1_id"], clean["cand_id"]):
+        flags = {p: bool(cand_id in pass_maps.get(p, {}).get(s1_id, ())) for p in _PASS_NAMES}
+        n_ret = sum(flags.values())
+        if n_ret == 0:
+            status = "NONE"
+        elif n_ret == 1:
+            status = f"{next(p for p in _PASS_NAMES if flags[p]).upper()}_ONLY"
+        else:
+            status = "MULTIPLE"
+        rows.append({
+            "s1_id": s1_id, "cand_id": cand_id, "country": s1_country.get(s1_id, ""),
+            **{f"retrieved_{p}": flags[p] for p in _PASS_NAMES},
+            "n_blockers_retrieved": n_ret, "blocker_status": status,
+        })
+    detail = pd.DataFrame(rows)
+
+    # Sanity check 2: a pair an individual pass retrieved should be explainable by the
+    # production union logic -- but sanity check 1 already proved every clean FN pair
+    # is absent from that union, so any row with n_blockers_retrieved > 0 here is a
+    # genuine discrepancy between an individual pass re-run and the production union
+    # construction, not something to silently accept.
+    inconsistent = detail[detail["n_blockers_retrieved"] > 0]
+    if len(inconsistent):
+        _log(f"WARNING: {len(inconsistent)} clean blocking FN(s) were retrieved by an "
+            f"individual pass re-run despite being absent from the production candidate "
+            f"union -- this is a discrepancy between individual-pass and union-construction "
+            f"logic in blocking.generate_candidates worth investigating, not an expected "
+            f"finding. Affected s1_id/cand_id pairs are in {detail_path.name}.")
+
+    total = len(detail)
+    n_any = int((detail["n_blockers_retrieved"] > 0).sum())
+    n_none = total - n_any
+    pass_counts = {p: int(detail[f"retrieved_{p}"].sum()) for p in _PASS_NAMES}
+    status_counts = detail["blocker_status"].value_counts().to_dict()
+
+    def _pct(n: int, d: int) -> float:
+        """Percentage of ``n`` over ``d``, 0.0 when ``d`` is 0."""
+        return (n / d * 100.0) if d else 0.0
+
+    summary_rows = [
+        {"metric": "total_clean_blocking_fns", "value": total},
+        {"metric": "retrieved_by_at_least_one_blocker", "value": n_any},
+        {"metric": "retrieved_by_no_blocker", "value": n_none},
+        {"metric": "retrieved_by_at_least_one_blocker_pct", "value": _pct(n_any, total)},
+        {"metric": "retrieved_by_no_blocker_pct", "value": _pct(n_none, total)},
+    ]
+    for p in _PASS_NAMES:
+        summary_rows.append({"metric": f"{p}_count", "value": pass_counts[p]})
+        summary_rows.append({"metric": f"{p}_pct", "value": _pct(pass_counts[p], total)})
+    for status in _STATUS_ORDER:
+        cnt = int(status_counts.get(status, 0))
+        summary_rows.append({"metric": f"status_{status}_count", "value": cnt})
+        summary_rows.append({"metric": f"status_{status}_pct", "value": _pct(cnt, total)})
+    for country, g in detail.groupby("country"):
+        n_c = len(g)
+        n_c_any = int((g["n_blockers_retrieved"] > 0).sum())
+        summary_rows.append({"metric": f"country_{country}_n", "value": n_c})
+        summary_rows.append({"metric": f"country_{country}_retrieved_by_any", "value": n_c_any})
+        summary_rows.append({"metric": f"country_{country}_retrieved_by_any_pct",
+                            "value": _pct(n_c_any, n_c)})
+    summary = pd.DataFrame(summary_rows)
+
+    detail.to_csv(detail_path, sep="\t", index=False)
+    summary.to_csv(summary_path, sep="\t", index=False)
+    meta = {
+        "kind": "blocking_fn_attribution", "timestamp": ts, "sample": sample,
+        "use_embeddings": use_embeddings, "git_commit": rp._git_hash(),
+        "dataset_file_hashes": diag.dataset_file_hashes(config.TRAIN_FILES),
+        "env": diag.env_info(), "n_clean_blocking_fns": total,
+        "n_inconsistent_with_union": int(len(inconsistent)),
+    }
+    diag.save_json(meta, out_dir / "meta.json")
+    _log(f"blocking FN attribution written under {out_dir}")
+
+    print(f"\nClean blocking FNs: {total}\n")
+    for p in _PASS_NAMES:
+        print(f"{p.upper():<12}{pass_counts[p]} / {total} ({_pct(pass_counts[p], total):.1f}%)")
+    print(f"\nRetrieved by >=1 blocker: {n_any} / {total} ({_pct(n_any, total):.1f}%)")
+    print(f"Retrieved by none:         {n_none} / {total} ({_pct(n_none, total):.1f}%)")
+    print("\nStatus:")
+    for status in _STATUS_ORDER:
+        cnt = int(status_counts.get(status, 0))
+        print(f"  {status:<12}{cnt} / {total} ({_pct(cnt, total):.1f}%)")
+    print("\nBy country:")
+    for country, g in detail.groupby("country"):
+        n_c = len(g)
+        n_c_any = int((g["n_blockers_retrieved"] > 0).sum())
+        print(f"  {country}: n={n_c}, retrieved_by_any={n_c_any} ({_pct(n_c_any, n_c):.1f}%)")
+
+    return {"detail": detail, "summary": summary, "out_dir": str(out_dir)}
+
+
 # --- CLI ---------------------------------------------------------------------------------
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -2314,6 +2579,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                      help="S1 sample fraction (default: 0.0045, the reproducible baseline scale)")
     fhn.add_argument("--no-embeddings", action="store_true")
 
+    bfa = sub.add_parser(
+        "blocking-fn-attribution",
+        help="Attribute clean (no representation-loss) blocking false negatives to "
+             "individual production blocking passes")
+    bfa.add_argument("--sample", type=float, default=0.0045,
+                     help="S1 sample fraction (default: 0.0045, the reproducible baseline scale)")
+    bfa.add_argument("--no-embeddings", action="store_true")
+
     return parser.parse_args(argv)
 
 
@@ -2344,6 +2617,8 @@ def main(argv: list[str] | None = None) -> None:
         run_loco_comparison(args.sample, not args.no_embeddings)
     elif args.command == "feature-hard-negative":
         run_feature_hard_negative_audit(args.sample, not args.no_embeddings)
+    elif args.command == "blocking-fn-attribution":
+        run_blocking_fn_attribution(args.sample, not args.no_embeddings)
 
 
 if __name__ == "__main__":
