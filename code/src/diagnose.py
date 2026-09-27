@@ -25,6 +25,7 @@ Usage (from code/business_entity_resolution/)::
     python -m src.diagnose loco [--sample 0.0045] [--no-embeddings]
     python -m src.diagnose feature-hard-negative [--sample 0.0045] [--no-embeddings]
     python -m src.diagnose blocking-fn-attribution [--sample 0.0045] [--no-embeddings]
+    python -m src.diagnose blocking-fn-forensics [--sample 0.0045] [--no-embeddings]
 
 Every subcommand is measurement-only: none of them changes ``output/``, and
 none of them is wired to run automatically -- each is a separate, explicit CLI
@@ -40,6 +41,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from rapidfuzz import fuzz
+from rapidfuzz.distance import JaroWinkler
 
 from . import config
 from . import diagnostics as diag
@@ -51,7 +54,8 @@ from .blocking import (address_pass, country_groups, dense_topk, digit_token_pas
                        report_blocking_stats, tfidf_name_pass)
 from .decide import apply_threshold, assign_one_to_one, tune_threshold
 from .evaluate import blocking_recall, score_report
-from .features import FeatureContext, build_features, feature_columns, label_pairs
+from .features import (FeatureContext, build_features, feature_columns, label_pairs,
+                       pair_features)
 from .io_utils import load_source, load_split
 from .model import feature_importance, group_folds, predict, train_full, train_oof
 
@@ -2300,6 +2304,58 @@ def _blocking_passes_by_country(
     return out
 
 
+def _clean_blocking_fn_pairs(
+    sample: float, use_embeddings: bool
+) -> tuple[pd.DataFrame, pd.DataFrame, dict, dict[str, str]]:
+    """The exact "clean" blocking-false-negative pair set both
+    ``blocking-fn-attribution`` and ``blocking-fn-forensics`` inspect: every true
+    (S1, candidate) pair ``error_decomposition.classify_true_pairs`` stages as
+    ``blocking_false_negative`` (absent from the production candidate union) with
+    every one of ``error_decomposition.LOSS_KEYS``'s six representation-loss flags
+    False.
+
+    Factored out of ``run_blocking_fn_attribution`` (this is exactly the computation
+    it used to do inline, unchanged) so ``run_blocking_fn_forensics`` inspects
+    literally the same 97-pair set that command reports on a given ``--sample``, from
+    the same deterministic sample and the same production-default classification
+    path, rather than an independently regenerated approximation of it.
+
+    Returns ``(clean, cands, prep, s1_country)``: ``clean`` has ``s1_id``/``cand_id``
+    plus every ``LOSS_KEYS`` column (all False by construction) and ``stage`` (always
+    ``"blocking_false_negative"``); ``cands`` is the production-default candidate
+    union used for that classification; ``prep`` is
+    ``run_pipeline.prepare``'s output; ``s1_country`` is ``{s1_id: country}``.
+    """
+    s1, s2, s3, truth = rp._load_train(sample)
+    ctx = run_valid_for_diagnostics(s1, s2, s3, truth, use_embeddings)
+    prep, cands, scored, pred, tau = ctx["prep"], ctx["cands"], ctx["scored"], ctx["pred"], ctx["tau"]
+    valid_truth = {s: truth.get(s, []) for s in ctx["valid_ids"]}
+    s1_country = dict(zip(prep["s1"][config.ID_COL], prep["s1"][config.COUNTRY_COL]))
+
+    classified = edecomp.classify_true_pairs(
+        prep["s1"], prep["others"], cands, scored, pred, valid_truth, tau)
+
+    loss_cols = list(edecomp.LOSS_KEYS)
+    is_bfn = classified["stage"] == "blocking_false_negative"
+    no_loss = ~classified[loss_cols].any(axis=1) if len(classified) else pd.Series(dtype=bool)
+    clean = classified[is_bfn & no_loss].reset_index(drop=True)
+    # Sanity check 4: every selected pair must have all six representation-loss
+    # flags False -- guaranteed by the filter above; asserted explicitly so a future
+    # edit to that filter can never silently include a representation-failure row.
+    assert not clean[loss_cols].any().any(), \
+        "clean blocking FN selection must have every representation-loss flag False"
+
+    # Sanity check 1: every clean FN pair must be absent from the exact candidate
+    # union `classify_true_pairs` itself checked against to assign the
+    # "blocking_false_negative" stage in the first place.
+    cand_key = set(zip(cands["s1_id"], cands["cand_id"]))
+    still_in_union = any((s, c) in cand_key for s, c in zip(clean["s1_id"], clean["cand_id"]))
+    assert not still_in_union, \
+        "clean blocking FN pairs must be absent from the final baseline candidate union"
+
+    return clean, cands, prep, s1_country
+
+
 def run_blocking_fn_attribution(sample: float = 0.0045,
                                 use_embeddings: bool = True) -> dict:
     """Measurement-only diagnostic: attribute each "clean" blocking false negative --
@@ -2350,35 +2406,10 @@ def run_blocking_fn_attribution(sample: float = 0.0045,
     out_dir = DIAG_DIR / f"blocking_fn_attribution_{ts}"
     _log(f"blocking FN attribution: sample={sample}")
 
-    s1, s2, s3, truth = rp._load_train(sample)
-    ctx = run_valid_for_diagnostics(s1, s2, s3, truth, use_embeddings)
-    prep, cands, scored, pred, tau = ctx["prep"], ctx["cands"], ctx["scored"], ctx["pred"], ctx["tau"]
-    valid_truth = {s: truth.get(s, []) for s in ctx["valid_ids"]}
-    s1_country = dict(zip(prep["s1"][config.ID_COL], prep["s1"][config.COUNTRY_COL]))
-
-    classified = edecomp.classify_true_pairs(
-        prep["s1"], prep["others"], cands, scored, pred, valid_truth, tau)
-
-    loss_cols = list(edecomp.LOSS_KEYS)
-    is_bfn = classified["stage"] == "blocking_false_negative"
-    no_loss = ~classified[loss_cols].any(axis=1) if len(classified) else pd.Series(dtype=bool)
-    clean = classified[is_bfn & no_loss].reset_index(drop=True)
-    # Sanity check 4: every selected pair must have all six representation-loss
-    # flags False -- guaranteed by the filter above; asserted explicitly so a future
-    # edit to that filter can never silently include a representation-failure row.
-    assert not clean[loss_cols].any().any(), \
-        "clean blocking FN selection must have every representation-loss flag False"
-
-    # Sanity check 1: every clean FN pair must be absent from the exact candidate
-    # union `classify_true_pairs` itself checked against to assign the
-    # "blocking_false_negative" stage in the first place.
-    cand_key = set(zip(cands["s1_id"], cands["cand_id"]))
-    still_in_union = any((s, c) in cand_key for s, c in zip(clean["s1_id"], clean["cand_id"]))
-    assert not still_in_union, \
-        "clean blocking FN pairs must be absent from the final baseline candidate union"
-
+    clean, cands, prep, s1_country = _clean_blocking_fn_pairs(sample, use_embeddings)
     _log(f"blocking FN attribution: {len(clean)} clean blocking FNs "
-        f"(stage=blocking_false_negative, all {len(loss_cols)} representation-loss flags False)")
+        f"(stage=blocking_false_negative, all {len(edecomp.LOSS_KEYS)} "
+        f"representation-loss flags False)")
 
     DIAG_DIR.mkdir(parents=True, exist_ok=True)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -2497,6 +2528,295 @@ def run_blocking_fn_attribution(sample: float = 0.0045,
     return {"detail": detail, "summary": summary, "out_dir": str(out_dir)}
 
 
+# --- blocking-FN pair-level forensics ------------------------------------------------------
+
+#: Name/address raw+normalised fields carried through to the detail TSV, per side.
+_FORENSICS_NAME_FIELDS = ("name_norm", "name_core", "first_token")
+_FORENSICS_ADDR_FIELDS = ("addr_norm",)
+_FORENSICS_NUM_FIELDS = ("digits", "house_no", "region")
+
+#: Deterministic forensic categories, checked in this order (first match wins).
+_FORENSICS_CATEGORIES = ("MULTI_FIELD_SIGNAL", "NAME_SIGNAL", "ADDRESS_SIGNAL",
+                         "NUMERIC_SIGNAL", "VERY_LOW_SIGNAL")
+
+#: Thresholds behind ``strong_name_signal``/``strong_address_signal`` below. Deliberately
+#: conservative, round similarity cutoffs -- not fit or tuned on this data -- so the
+#: classification stays a transparent, inspectable rule rather than a black-box score.
+_STRONG_JACCARD = 0.5
+_STRONG_JW = 0.90
+_STRONG_TOKEN_SORT = 0.85
+_STRONG_OVERLAP = 2
+
+
+def _token_set(text: str) -> frozenset[str]:
+    """Space-separated tokens of one normalised field, as a frozenset."""
+    return frozenset(str(text).split())
+
+
+def run_blocking_fn_forensics(sample: float = 0.0045, use_embeddings: bool = True) -> dict:
+    """Measurement-only diagnostic: pair-level forensic measurements for the exact
+    "clean" blocking false negatives ``blocking-fn-attribution`` reports (true pairs
+    staged ``blocking_false_negative`` with every representation-loss flag False, so
+    every individual blocking pass provably missed them and no mechanical raw-vs-
+    normalised signal loss explains it either) -- investigating what these pairs
+    actually look like, field by field, so that possible new blocking signals can be
+    considered later from evidence rather than guesswork.
+
+    Reuses, unmodified: :func:`_clean_blocking_fn_pairs` (the exact same 97-pair set,
+    from the exact same deterministic sample and production-default classification
+    path, that ``blocking-fn-attribution`` reports -- never a newly regenerated
+    approximation of it) and ``features.pair_features`` (the exact production
+    pairwise-similarity implementation -- Jaro-Winkler, rapidfuzz ratio/partial/
+    token-sort, TF-IDF cosine, token Jaccard, digit/house/region equality -- fitted
+    via ``features.FeatureContext.fit`` on this sample's own S1+others exactly as
+    ``features.build_features`` does when given no context). The only similarity
+    numbers computed outside ``pair_features`` here are ones it does not already
+    expose: exact ``name_norm`` equality, address Jaro-Winkler (``pair_features`` only
+    has rapidfuzz ratio/token-set/token-sort/partial for address, not Jaro-Winkler),
+    token *overlap counts* (``pair_features`` has Jaccard but not the raw intersection
+    size) and the actual shared-token lists -- each a direct, undisputed
+    set/rapidfuzz computation on the same normalised fields, never a new formula.
+
+    Classifies each pair into exactly one of :data:`_FORENSICS_CATEGORIES`
+    (``MULTI_FIELD_SIGNAL`` > ``NAME_SIGNAL`` > ``ADDRESS_SIGNAL`` > ``NUMERIC_SIGNAL``
+    > ``VERY_LOW_SIGNAL``, first match wins) via three transparent boolean gates
+    (``strong_name_signal``/``strong_address_signal``/``strong_numeric_signal``,
+    each kept as its own column in the detail TSV) built from fixed, round similarity
+    thresholds (:data:`_STRONG_JACCARD`/:data:`_STRONG_JW`/:data:`_STRONG_TOKEN_SORT`/
+    :data:`_STRONG_OVERLAP`) -- never a learned or fitted score. These forensic
+    similarity numbers are diagnostic-only: this function never feeds them to
+    ``blocking.generate_candidates``, never adds them as a new blocking pass, and
+    changes no ``config.py``/``blocking.py``/``features.py``/``normalize.py``/
+    ``model.py`` default, threshold or K value.
+
+    Writes ``clean_fn_forensics.tsv`` (one row per clean blocking FN) and
+    ``summary.tsv`` (aggregate + per-country counts) under
+    ``artifacts/diagnostics/blocking_fn_forensics_<ts>/`` (plus a ``meta.json``
+    sidecar, mirroring this module's other diagnostics). Never touches ``output/``.
+    """
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    out_dir = DIAG_DIR / f"blocking_fn_forensics_{ts}"
+    _log(f"blocking FN forensics: sample={sample}")
+
+    clean, _cands, prep, s1_country = _clean_blocking_fn_pairs(sample, use_embeddings)
+    _log(f"blocking FN forensics: {len(clean)} clean blocking FNs "
+        f"(stage=blocking_false_negative, all {len(edecomp.LOSS_KEYS)} "
+        f"representation-loss flags False)")
+
+    DIAG_DIR.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    detail_path = out_dir / "clean_fn_forensics.tsv"
+    summary_path = out_dir / "summary.tsv"
+
+    if len(clean) == 0:
+        _log("blocking FN forensics: no clean blocking FNs in this sample -- nothing to inspect")
+        detail = pd.DataFrame()
+        summary = pd.DataFrame([{"metric": "total_clean_fns", "value": 0}])
+        detail.to_csv(detail_path, sep="\t", index=False)
+        summary.to_csv(summary_path, sep="\t", index=False)
+        return {"detail": detail, "summary": summary, "out_dir": str(out_dir)}
+
+    s1_frame, others_frame = prep["s1"], prep["others"]
+    s1_pos = pd.Index(s1_frame[config.ID_COL]).get_indexer(clean["s1_id"])
+    o_pos = pd.Index(others_frame[config.ID_COL]).get_indexer(clean["cand_id"])
+    if (s1_pos < 0).any() or (o_pos < 0).any():
+        raise ValueError("clean blocking FN IDs missing from the normalised S1/others frames")
+    r1 = s1_frame.iloc[s1_pos].reset_index(drop=True)
+    r2 = others_frame.iloc[o_pos].reset_index(drop=True)
+
+    # Production similarity implementation, unmodified: the same FeatureContext.fit
+    # + pair_features path build_features itself uses when given no context.
+    ctx = FeatureContext.fit(s1_frame, others_frame)
+    pf = pair_features(r1, r2, ctx, emb=None)
+
+    name_core_sets = [_token_set(t) for t in r1["name_core"]], [_token_set(t) for t in r2["name_core"]]
+    addr_norm_sets = [_token_set(t) for t in r1["addr_norm"]], [_token_set(t) for t in r2["addr_norm"]]
+    name_shared = [a & b for a, b in zip(*name_core_sets)]
+    addr_shared = [a & b for a, b in zip(*addr_norm_sets)]
+
+    addr1, addr2 = r1["addr_norm"].tolist(), r2["addr_norm"].tolist()
+    addr_jw = np.array([JaroWinkler.normalized_similarity(a, b) if a and b else np.nan
+                       for a, b in zip(addr1, addr2)], dtype=np.float32)
+    name_exact_norm = (r1["name_norm"].to_numpy() == r2["name_norm"].to_numpy())
+
+    rows = []
+    for i in range(len(clean)):
+        row: dict = {
+            "s1_id": clean["s1_id"].iat[i], "cand_id": clean["cand_id"].iat[i],
+            "country": s1_country.get(clean["s1_id"].iat[i], ""),
+        }
+        for field in _FORENSICS_NAME_FIELDS:
+            row[f"s1_{field}"] = r1[field].iat[i]
+            row[f"cand_{field}"] = r2[field].iat[i]
+        for field in _FORENSICS_ADDR_FIELDS:
+            row[f"s1_{field}"] = r1[field].iat[i]
+            row[f"cand_{field}"] = r2[field].iat[i]
+        for field, out_name in (("digits", "digits"), ("house_no", "house_number"), ("region", "region")):
+            row[f"s1_{out_name}"] = r1[field].iat[i]
+            row[f"cand_{out_name}"] = r2[field].iat[i]
+
+        row["name_exact_norm"] = bool(name_exact_norm[i])
+        row["name_exact_core"] = bool(pf["name_core_exact"].iat[i])
+        row["name_token_jaccard"] = float(pf["name_token_jaccard"].iat[i])
+        row["name_token_overlap_count"] = len(name_shared[i])
+        row["name_jaro_winkler"] = float(pf["name_jw"].iat[i])
+        row["name_edit_ratio"] = float(pf["name_ratio"].iat[i])
+        row["name_partial_ratio"] = float(pf["name_partial"].iat[i])
+        row["name_token_sort_ratio"] = float(pf["name_token_sort"].iat[i])
+
+        addr_jac = pf["addr_token_jaccard"].iat[i]
+        row["addr_token_jaccard"] = float(addr_jac) if not np.isnan(addr_jac) else np.nan
+        row["addr_token_overlap_count"] = len(addr_shared[i])
+        row["addr_jaro_winkler"] = float(addr_jw[i]) if not np.isnan(addr_jw[i]) else np.nan
+        for out_name, col in (("addr_edit_ratio", "addr_ratio"),
+                              ("addr_partial_ratio", "addr_partial"),
+                              ("addr_token_sort_ratio", "addr_token_sort")):
+            v = pf[col].iat[i]
+            row[out_name] = float(v) if not np.isnan(v) else np.nan
+
+        row["digit_shared_count"] = float(pf["digit_shared"].iat[i])
+        dj = pf["digit_jaccard"].iat[i]
+        row["digit_jaccard"] = float(dj) if not np.isnan(dj) else np.nan
+        he = pf["house_equal"].iat[i]
+        row["house_equal"] = (bool(he) if not np.isnan(he) else np.nan)
+        re_ = pf["region_equal"].iat[i]
+        row["region_equal"] = (bool(re_) if not np.isnan(re_) else np.nan)
+
+        row["shared_name_tokens"] = ",".join(sorted(name_shared[i]))
+        row["shared_address_tokens"] = ",".join(sorted(addr_shared[i]))
+
+        # --- transparent, deterministic forensic category gates ---------------------
+        strong_name = bool(
+            row["name_exact_norm"] or row["name_exact_core"]
+            or row["name_token_jaccard"] >= _STRONG_JACCARD
+            or row["name_jaro_winkler"] >= _STRONG_JW
+            or row["name_token_sort_ratio"] >= _STRONG_TOKEN_SORT)
+        strong_addr = bool(
+            (not np.isnan(row["addr_token_jaccard"]) and row["addr_token_jaccard"] >= _STRONG_JACCARD)
+            or (not np.isnan(row["addr_jaro_winkler"]) and row["addr_jaro_winkler"] >= _STRONG_JW)
+            or row["addr_token_sort_ratio"] >= _STRONG_TOKEN_SORT
+            or row["addr_token_overlap_count"] >= _STRONG_OVERLAP)
+        strong_numeric = bool(
+            (row["house_equal"] is True) or (row["region_equal"] is True)
+            or row["digit_shared_count"] >= 1)
+        row["strong_name_signal"] = strong_name
+        row["strong_address_signal"] = strong_addr
+        row["strong_numeric_signal"] = strong_numeric
+        n_fields = int(strong_name) + int(strong_addr) + int(strong_numeric)
+        row["signal_field_count"] = n_fields
+        if n_fields >= 2:
+            row["forensic_category"] = "MULTI_FIELD_SIGNAL"
+        elif strong_name:
+            row["forensic_category"] = "NAME_SIGNAL"
+        elif strong_addr:
+            row["forensic_category"] = "ADDRESS_SIGNAL"
+        elif strong_numeric:
+            row["forensic_category"] = "NUMERIC_SIGNAL"
+        else:
+            row["forensic_category"] = "VERY_LOW_SIGNAL"
+        rows.append(row)
+
+    detail = pd.DataFrame(rows)
+    total = len(detail)
+
+    def _pct(n: int, d: int) -> float:
+        """Percentage of ``n`` over ``d``, 0.0 when ``d`` is 0."""
+        return (n / d * 100.0) if d else 0.0
+
+    def _count(mask: pd.Series) -> int:
+        """Count of True values in a boolean-or-NaN-safe mask."""
+        return int(mask.fillna(False).astype(bool).sum())
+
+    cat_counts = detail["forensic_category"].value_counts().to_dict()
+    agg = {
+        "total_clean_fns": total,
+        "name_exact_norm_count": _count(detail["name_exact_norm"]),
+        "name_exact_core_count": _count(detail["name_exact_core"]),
+        "name_token_overlap_count": _count(detail["name_token_overlap_count"] > 0),
+        "strong_name_similarity_count": _count(detail["strong_name_signal"]),
+        "address_token_overlap_count": _count(detail["addr_token_overlap_count"] > 0),
+        "strong_address_similarity_count": _count(detail["strong_address_signal"]),
+        "digit_overlap_count": _count(detail["digit_shared_count"] > 0),
+        "house_match_count": _count(detail["house_equal"] == True),  # noqa: E712 -- NaN-safe tri-state
+        "region_match_count": _count(detail["region_equal"] == True),  # noqa: E712
+        "multi_field_signal_count": int(cat_counts.get("MULTI_FIELD_SIGNAL", 0)),
+        "very_low_signal_count": int(cat_counts.get("VERY_LOW_SIGNAL", 0)),
+    }
+    summary_rows = [{"metric": k, "value": v} for k, v in agg.items()]
+    for cat in _FORENSICS_CATEGORIES:
+        summary_rows.append({"metric": f"category_{cat}_count", "value": int(cat_counts.get(cat, 0))})
+        summary_rows.append({"metric": f"category_{cat}_pct",
+                            "value": _pct(int(cat_counts.get(cat, 0)), total)})
+
+    for country, g in detail.groupby("country"):
+        n_c = len(g)
+        g_cat_counts = g["forensic_category"].value_counts().to_dict()
+        prefix = f"country_{country}_"
+        summary_rows.append({"metric": f"{prefix}total_clean_fns", "value": n_c})
+        summary_rows.append({"metric": f"{prefix}name_exact_norm_count",
+                            "value": _count(g["name_exact_norm"])})
+        summary_rows.append({"metric": f"{prefix}name_exact_core_count",
+                            "value": _count(g["name_exact_core"])})
+        summary_rows.append({"metric": f"{prefix}strong_name_similarity_count",
+                            "value": _count(g["strong_name_signal"])})
+        summary_rows.append({"metric": f"{prefix}strong_address_similarity_count",
+                            "value": _count(g["strong_address_signal"])})
+        summary_rows.append({"metric": f"{prefix}digit_overlap_count",
+                            "value": _count(g["digit_shared_count"] > 0)})
+        summary_rows.append({"metric": f"{prefix}house_match_count",
+                            "value": _count(g["house_equal"] == True)})  # noqa: E712
+        summary_rows.append({"metric": f"{prefix}region_match_count",
+                            "value": _count(g["region_equal"] == True)})  # noqa: E712
+        for cat in _FORENSICS_CATEGORIES:
+            summary_rows.append({"metric": f"{prefix}category_{cat}_count",
+                                "value": int(g_cat_counts.get(cat, 0))})
+    summary = pd.DataFrame(summary_rows)
+
+    detail.to_csv(detail_path, sep="\t", index=False)
+    summary.to_csv(summary_path, sep="\t", index=False)
+    meta = {
+        "kind": "blocking_fn_forensics", "timestamp": ts, "sample": sample,
+        "use_embeddings": use_embeddings, "git_commit": rp._git_hash(),
+        "dataset_file_hashes": diag.dataset_file_hashes(config.TRAIN_FILES),
+        "env": diag.env_info(), "n_clean_fns": total,
+        "thresholds": {"strong_jaccard": _STRONG_JACCARD, "strong_jaro_winkler": _STRONG_JW,
+                      "strong_token_sort": _STRONG_TOKEN_SORT, "strong_overlap": _STRONG_OVERLAP},
+    }
+    diag.save_json(meta, out_dir / "meta.json")
+    _log(f"blocking FN forensics written under {out_dir}")
+
+    print(f"\nClean blocking FNs inspected: {total}\n")
+    print(f"name_exact_norm:              {agg['name_exact_norm_count']} / {total} "
+        f"({_pct(agg['name_exact_norm_count'], total):.1f}%)")
+    print(f"name_exact_core:              {agg['name_exact_core_count']} / {total} "
+        f"({_pct(agg['name_exact_core_count'], total):.1f}%)")
+    print(f"strong_name_similarity:       {agg['strong_name_similarity_count']} / {total} "
+        f"({_pct(agg['strong_name_similarity_count'], total):.1f}%)")
+    print(f"strong_address_similarity:    {agg['strong_address_similarity_count']} / {total} "
+        f"({_pct(agg['strong_address_similarity_count'], total):.1f}%)")
+    print(f"digit_overlap:                {agg['digit_overlap_count']} / {total} "
+        f"({_pct(agg['digit_overlap_count'], total):.1f}%)")
+    print(f"house_match:                  {agg['house_match_count']} / {total} "
+        f"({_pct(agg['house_match_count'], total):.1f}%)")
+    print(f"region_match:                 {agg['region_match_count']} / {total} "
+        f"({_pct(agg['region_match_count'], total):.1f}%)")
+    print("\nForensic category:")
+    for cat in _FORENSICS_CATEGORIES:
+        cnt = int(cat_counts.get(cat, 0))
+        print(f"  {cat:<20}{cnt} / {total} ({_pct(cnt, total):.1f}%)")
+    print("\nBy country:")
+    for country, g in detail.groupby("country"):
+        n_c = len(g)
+        print(f"  {country}: n={n_c}")
+        g_cat_counts = g["forensic_category"].value_counts().to_dict()
+        for cat in _FORENSICS_CATEGORIES:
+            cnt = int(g_cat_counts.get(cat, 0))
+            if cnt:
+                print(f"    {cat:<20}{cnt} / {n_c} ({_pct(cnt, n_c):.1f}%)")
+
+    return {"detail": detail, "summary": summary, "out_dir": str(out_dir)}
+
+
 # --- CLI ---------------------------------------------------------------------------------
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -2587,6 +2907,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                      help="S1 sample fraction (default: 0.0045, the reproducible baseline scale)")
     bfa.add_argument("--no-embeddings", action="store_true")
 
+    bff = sub.add_parser(
+        "blocking-fn-forensics",
+        help="Pair-level forensic name/address/numeric similarity measurements for "
+             "the clean (no representation-loss) blocking false negatives")
+    bff.add_argument("--sample", type=float, default=0.0045,
+                     help="S1 sample fraction (default: 0.0045, the reproducible baseline scale)")
+    bff.add_argument("--no-embeddings", action="store_true")
+
     return parser.parse_args(argv)
 
 
@@ -2619,6 +2947,8 @@ def main(argv: list[str] | None = None) -> None:
         run_feature_hard_negative_audit(args.sample, not args.no_embeddings)
     elif args.command == "blocking-fn-attribution":
         run_blocking_fn_attribution(args.sample, not args.no_embeddings)
+    elif args.command == "blocking-fn-forensics":
+        run_blocking_fn_forensics(args.sample, not args.no_embeddings)
 
 
 if __name__ == "__main__":
