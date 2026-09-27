@@ -32,7 +32,7 @@ from rapidfuzz.distance import JaroWinkler
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 from . import config
-from .blocking import PASS_BITS
+from .blocking import BASE_PASSES, PASS_BITS
 from .normalize import SUFFIX_FAMILY
 
 KEY_COLS = ["s1_id", "cand_id"]
@@ -154,11 +154,31 @@ def _suffix_features(a: pd.Series, b: pd.Series) -> dict[str, np.ndarray]:
 
 # --- pairwise features ---------------------------------------------------------------
 
+def embedding_cosine(e1: np.ndarray, e2: np.ndarray, i1: np.ndarray, i2: np.ndarray,
+                     block: int = 65_536) -> np.ndarray:
+    """``emb_cos`` for pairs ``(i1[j], i2[j])`` of the full embedding matrices.
+
+    Gathers and multiplies ``block`` rows at a time, so the transient is
+    ``3 * block * dim`` floats instead of three full chunk-sized matrices. Each row's
+    value is computed exactly as ``(a * b).sum(axis=1)`` on the gathered rows, so the
+    result is bit-identical to gathering the whole chunk at once.
+    """
+    out = np.empty(len(i1), dtype=np.float32)
+    for s in range(0, len(i1), block):
+        a = np.asarray(e1[i1[s:s + block]], dtype=np.float32)
+        b = np.asarray(e2[i2[s:s + block]], dtype=np.float32)
+        out[s:s + block] = (a * b).sum(axis=1)
+    return out
+
+
 def pair_features(r1: pd.DataFrame, r2: pd.DataFrame, ctx: FeatureContext,
-                  emb: tuple[np.ndarray, np.ndarray] | None = None) -> pd.DataFrame:
+                  emb: tuple[np.ndarray, np.ndarray] | None = None,
+                  emb_cos: np.ndarray | None = None) -> pd.DataFrame:
     """Name + address features for aligned record frames ``r1`` (S1) and ``r2``.
 
     ``emb`` is ``(e1, e2)`` row-aligned with ``r1``/``r2`` (already gathered), or None.
+    ``emb_cos``, when given, is the precomputed embedding cosine (see
+    :func:`embedding_cosine`) and takes precedence over ``emb``.
     """
     f: dict[str, np.ndarray] = {}
     c1, c2 = r1["name_core"].tolist(), r2["name_core"].tolist()
@@ -223,7 +243,9 @@ def pair_features(r1: pd.DataFrame, r2: pd.DataFrame, ctx: FeatureContext,
     f["same_country"] = (r1[config.COUNTRY_COL].to_numpy() == r2[config.COUNTRY_COL].to_numpy()
                          ).astype(np.float32)
     # --- embedding
-    if emb is not None:
+    if emb_cos is not None:
+        f["emb_cos"] = np.asarray(emb_cos, dtype=np.float32)
+    elif emb is not None:
         f["emb_cos"] = (np.asarray(emb[0], dtype=np.float32)
                         * np.asarray(emb[1], dtype=np.float32)).sum(axis=1)
     else:
@@ -266,12 +288,16 @@ def blocking_features(cands: pd.DataFrame) -> pd.DataFrame:
     """Pass-membership flags, pass count and per-pass blocking scores."""
     out = {}
     passes = cands["passes"].to_numpy()
-    for name, bit in PASS_BITS.items():
+    # Base passes always; optional passes only when their score column is present
+    # (i.e. the pass was enabled when these candidates were generated).
+    names = [p for p in PASS_BITS if p in BASE_PASSES or f"score_{p}" in cands]
+    for name in names:
+        bit = PASS_BITS[name]
         out[f"in_{name}"] = ((passes & bit) > 0).astype(np.float32)
         col = f"score_{name}"
         out[f"block_{name}"] = (cands[col].to_numpy(np.float32) if col in cands
                                 else np.full(len(cands), np.nan, np.float32))
-    out["n_passes"] = sum(out[f"in_{n}"] for n in PASS_BITS)
+    out["n_passes"] = sum(out[f"in_{n}"] for n in names)
     return pd.DataFrame(out, index=cands.index)
 
 
@@ -283,7 +309,7 @@ def build_features(
     others: pd.DataFrame,
     embeddings: tuple[np.ndarray, np.ndarray] | None = None,
     ctx: FeatureContext | None = None,
-    chunk: int = config.FEATURE_CHUNK,
+    chunk: int | None = None,
     verbose: bool = True,
 ) -> pd.DataFrame:
     """Return one float32 feature row per candidate pair, keyed by ``s1_id``/``cand_id``.
@@ -294,9 +320,10 @@ def build_features(
         embeddings: ``(s1_emb, others_emb)`` row-aligned with the frames, or None
             (``emb_cos`` becomes NaN).
         ctx: fitted :class:`FeatureContext`; fitted on ``s1``+``others`` if None.
-        chunk: pairs per chunk.
+        chunk: pairs per chunk; None reads ``config.FEATURE_CHUNK`` at call time.
         verbose: print progress.
     """
+    chunk = config.FEATURE_CHUNK if chunk is None else chunk
     s1 = s1.reset_index(drop=True)
     others = others.reset_index(drop=True)
     cands = cands.reset_index(drop=True)
@@ -310,35 +337,44 @@ def build_features(
     n = len(cands)
     if verbose:
         _log(f"before build_features: rss={_rss_mb():.0f}MiB")
-    # Each chunk is written into a preallocated buffer sized for the full pair
-    # count instead of being appended to a list, so peak memory is ~1x the final
-    # feature matrix rather than growing with the number of retained chunks.
-    buffers: dict[str, np.ndarray] | None = None
+    # Every chunk is written into ONE preallocated float32 block of shape
+    # (n_features, n_pairs). Wrapping its transpose in a DataFrame reuses the memory
+    # as pandas' single float block, so assembling the output frame no longer copies
+    # every feature column (measured +214 B/pair transient with per-column buffers).
+    block: np.ndarray | None = None
+    names: list[str] = []
     t0 = time.time()
     for start in range(0, n, chunk):
         end = min(start + chunk, n)
         a, b = i1[start:end], i2[start:end]
         r1 = s1.iloc[a].reset_index(drop=True)
         r2 = others.iloc[b].reset_index(drop=True)
-        emb = (embeddings[0][a], embeddings[1][b]) if embeddings is not None else None
-        part = pair_features(r1, r2, ctx, emb)
-        if buffers is None:
-            buffers = {col: np.empty(n, dtype=np.float32) for col in part.columns}
-        for col in part.columns:
-            buffers[col][start:end] = part[col].to_numpy()
+        cos = (embedding_cosine(embeddings[0], embeddings[1], a, b)
+               if embeddings is not None else None)
+        part = pair_features(r1, r2, ctx, emb_cos=cos)
+        del r1, r2, cos
+        if block is None:
+            names = list(part.columns)
+            block = np.empty((len(names), n), dtype=np.float32)
+        for j, col in enumerate(names):
+            block[j, start:end] = part[col].to_numpy()
+        del part
         if verbose:
             _log(f"{end:,}/{n:,} pairs ({time.time() - t0:.0f}s) rss={_rss_mb():.0f}MiB")
-    if buffers is None:
-        empty = pair_features(s1.iloc[:0], others.iloc[:0], ctx, None)
-        buffers = {col: np.empty(0, dtype=np.float32) for col in empty.columns}
+    if block is None:
+        names = list(pair_features(s1.iloc[:0], others.iloc[:0], ctx, None).columns)
+        block = np.empty((len(names), 0), dtype=np.float32)
 
     if verbose:
         _log(f"before assembling output frame: rss={_rss_mb():.0f}MiB")
+    out = pd.DataFrame(block.T, columns=names, copy=False)
+    del block  # the frame now owns the memory
+    out.insert(0, KEY_COLS[1], cands["cand_id"].to_numpy())
+    out.insert(0, KEY_COLS[0], cands["s1_id"].to_numpy())
     bf = blocking_features(cands)
-    data = {KEY_COLS[0]: cands["s1_id"].to_numpy(), KEY_COLS[1]: cands["cand_id"].to_numpy()}
-    data.update(buffers)
-    data.update({col: bf[col].to_numpy() for col in bf.columns})
-    out = pd.DataFrame(data)
+    for col in bf.columns:
+        out[col] = bf[col].to_numpy()
+    del bf
     if verbose:
         _log(f"after assembling output frame: rss={_rss_mb():.0f}MiB")
     out = context_features(out)

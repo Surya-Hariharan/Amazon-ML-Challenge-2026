@@ -179,16 +179,17 @@ def synthetic_blocked():
 def test_generate_candidates_schema_and_recall(synthetic_blocked):
     """Union has one row per pair, valid pass bits, and high recall on easy data."""
     s1n, others, truth, cands = synthetic_blocked
-    assert list(cands.columns) == ["s1_id", "cand_id", "passes"] + [f"score_{p}" for p in PASS_BITS]
+    active = blocking.active_passes()
+    assert list(cands.columns) == ["s1_id", "cand_id", "passes"] + [f"score_{p}" for p in active]
     assert not cands.duplicated(["s1_id", "cand_id"]).any()
-    assert cands["passes"].between(1, sum(PASS_BITS.values())).all()
+    assert cands["passes"].between(1, sum(PASS_BITS[p] for p in active)).all()
     assert cands["cand_id"].str.match(r"^S[23]-").all()
     stats = report_blocking_stats(cands, truth, list(s1n["entity_id"]), len(others),
                                   dict(zip(s1n["entity_id"], s1n["country"])), verbose=False)
     assert stats["pair_recall"] >= 0.95
     assert 0 < stats["reduction_ratio"] < 1
     assert "recall_France" in stats  # unseen-in-training country flows through
-    for p in PASS_BITS:
+    for p in active:
         assert stats[f"pairs_{p}"] > 0, p
 
 

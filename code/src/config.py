@@ -109,6 +109,10 @@ USE_EMBEDDINGS = True
 EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 EMBEDDING_REVISION = "e8f8c211226b894fcb81acc59f3b34ba3efd5f42"
 EMBEDDING_BATCH = 512
+#: Unique texts encoded per encoder call (bounds the encoder's transient buffers).
+#: Measured on 207k texts: peak +0.59 GiB at 50k vs +0.95 GiB at 262k (matrix 0.30 GiB);
+#: GPU batching is EMBEDDING_BATCH either way, so throughput is unaffected.
+EMBEDDING_ENCODE_CHUNK = 65_536
 K_EMBEDDING = 20
 #: Query / index block sizes for the chunked exact top-k search.
 DENSE_QUERY_CHUNK = 4096
@@ -129,8 +133,37 @@ DIGIT_MAX_BLOCK = 200
 USE_ADDRESS_PASS = True
 K_ADDRESS = 10
 ADDRESS_MAX_BLOCK = 100
+#: "first": keys anchored on the first digit token only (original behaviour).
+#: "all": ``digit@word`` for each of the first ``ADDRESS_MAX_DIGITS`` digit tokens, so
+#: sources that order/prefix house numbers differently ("12" vs "145 12") still share
+#: a key (diagnostic D2: first-digit anchoring gave 79/80 strong-address FNs no key).
+ADDRESS_KEY_MODE = "first"
+ADDRESS_MAX_DIGITS = 4
 
-#: S1 rows per chunk for the inverted-index passes (3-5).
+#: Digit tokens the key passes (digit, address) block on. "tokens": the normalised
+#: ``digits`` field (whole numeric tokens only). "runs": every digit run inside any
+#: ``addr_norm`` token, so "24637b", "f 45d", "a26" keep their numbers (D6b: ~12% of
+#: India records lose a digit run). Blocking-only: normalised fields and matcher
+#: features are unchanged.
+BLOCK_DIGIT_SOURCE = "tokens"
+
+#: Pass 6 — street-word pairs: unordered pairs of a record's rarest alphabetic
+#: address words, no digit required (digit-less addresses get no address-pass key).
+USE_STREET_PASS = False
+K_STREET = 10
+STREET_MAX_BLOCK = 100
+STREET_WORDS = 3
+
+#: Pass 7 — char 3-4-gram TF-IDF on ``name_core + " " + addr_norm``. Separate from the
+#: name pass (which is unchanged): name-only retrieval degrades with index density
+#: and misses transliterated names whose address matches (D3/D4).
+USE_TFIDF_ADDR_PASS = False
+K_TFIDF_ADDR = 20
+#: Optional index-side pruning to the N highest-weight n-grams per record (bounds the
+#: index matrix at full scale); None keeps every n-gram.
+TFIDF_ADDR_INDEX_TERMS = None
+
+#: S1 rows per chunk for the inverted-index passes (3-6).
 KEY_PASS_CHUNK = 50_000
 
 # --- Features (CP4) ----------------------------------------------------------------
@@ -177,5 +210,8 @@ TUNABLES = (
     "TFIDF_QUERY_TERMS",
     "USE_EMBEDDINGS", "K_EMBEDDING", "K_RARE_TOKEN", "RARE_MAX_BLOCK", "K_POSTAL_TOKEN",
     "DIGIT_MAX_BLOCK", "USE_ADDRESS_PASS", "K_ADDRESS", "ADDRESS_MAX_BLOCK",
+    "ADDRESS_KEY_MODE", "ADDRESS_MAX_DIGITS", "BLOCK_DIGIT_SOURCE",
+    "USE_STREET_PASS", "K_STREET", "STREET_MAX_BLOCK", "STREET_WORDS",
+    "USE_TFIDF_ADDR_PASS", "K_TFIDF_ADDR", "TFIDF_ADDR_INDEX_TERMS",
     "MATCH_THRESHOLD", "SINGLETON_THRESHOLD", "ONE_TO_ONE",
 )

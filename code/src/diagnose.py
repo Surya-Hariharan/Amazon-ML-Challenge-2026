@@ -26,6 +26,7 @@ Usage (from code/business_entity_resolution/)::
     python -m src.diagnose feature-hard-negative [--sample 0.0045] [--no-embeddings]
     python -m src.diagnose blocking-fn-attribution [--sample 0.0045] [--no-embeddings]
     python -m src.diagnose blocking-fn-forensics [--sample 0.0045] [--no-embeddings]
+    python -m src.diagnose blocking-address-forensics [--sample 0.0045] [--no-embeddings]
 
 Every subcommand is measurement-only: none of them changes ``output/``, and
 none of them is wired to run automatically -- each is a separate, explicit CLI
@@ -35,6 +36,7 @@ invocation, deliberately left for the user to trigger.
 from __future__ import annotations
 
 import argparse
+import json
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -49,13 +51,15 @@ from . import diagnostics as diag
 from . import drift as drift_mod
 from . import error_decomposition as edecomp
 from . import run_pipeline as rp
-from .blocking import (address_pass, country_groups, dense_topk, digit_token_pass,
-                       embedding_pass, generate_candidates, rare_token_pass,
-                       report_blocking_stats, tfidf_name_pass)
+from .blocking import (_ADDRESS_STOPWORDS, PASS_BITS, _address_keys, active_passes, address_pass,
+                       compute_embeddings, country_groups, dense_topk,
+                       digit_token_pass, embedding_pass, embedding_text, generate_candidates,
+                       key_pass, load_encoder, prune_rows,
+                       rare_token_pass, report_blocking_stats, tfidf_name_pass)
 from .decide import apply_threshold, assign_one_to_one, tune_threshold
 from .evaluate import blocking_recall, score_report
-from .features import (FeatureContext, build_features, feature_columns, label_pairs,
-                       pair_features)
+from .features import (KEY_COLS, FeatureContext, blocking_features, build_features,
+                       context_features, feature_columns, label_pairs, pair_features)
 from .io_utils import load_source, load_split
 from .model import feature_importance, group_folds, predict, train_full, train_oof
 
@@ -2553,68 +2557,19 @@ def _token_set(text: str) -> frozenset[str]:
     return frozenset(str(text).split())
 
 
-def run_blocking_fn_forensics(sample: float = 0.0045, use_embeddings: bool = True) -> dict:
-    """Measurement-only diagnostic: pair-level forensic measurements for the exact
-    "clean" blocking false negatives ``blocking-fn-attribution`` reports (true pairs
-    staged ``blocking_false_negative`` with every representation-loss flag False, so
-    every individual blocking pass provably missed them and no mechanical raw-vs-
-    normalised signal loss explains it either) -- investigating what these pairs
-    actually look like, field by field, so that possible new blocking signals can be
-    considered later from evidence rather than guesswork.
+def _fn_forensics_detail(clean: pd.DataFrame, prep: dict, s1_country: dict[str, str]) -> pd.DataFrame:
+    """Build the pair-level forensic detail table for a set of clean blocking-FN
+    pairs (``clean``, from :func:`_clean_blocking_fn_pairs`), using ``prep``'s
+    normalised S1/others frames. Factored out of ``run_blocking_fn_forensics`` so
+    other diagnostics (e.g. ``blocking-address-forensics``) can filter this exact
+    same per-pair table (in particular its ``strong_address_signal`` column) instead
+    of recomputing an independent approximation of it.
 
-    Reuses, unmodified: :func:`_clean_blocking_fn_pairs` (the exact same 97-pair set,
-    from the exact same deterministic sample and production-default classification
-    path, that ``blocking-fn-attribution`` reports -- never a newly regenerated
-    approximation of it) and ``features.pair_features`` (the exact production
-    pairwise-similarity implementation -- Jaro-Winkler, rapidfuzz ratio/partial/
-    token-sort, TF-IDF cosine, token Jaccard, digit/house/region equality -- fitted
-    via ``features.FeatureContext.fit`` on this sample's own S1+others exactly as
-    ``features.build_features`` does when given no context). The only similarity
-    numbers computed outside ``pair_features`` here are ones it does not already
-    expose: exact ``name_norm`` equality, address Jaro-Winkler (``pair_features`` only
-    has rapidfuzz ratio/token-set/token-sort/partial for address, not Jaro-Winkler),
-    token *overlap counts* (``pair_features`` has Jaccard but not the raw intersection
-    size) and the actual shared-token lists -- each a direct, undisputed
-    set/rapidfuzz computation on the same normalised fields, never a new formula.
-
-    Classifies each pair into exactly one of :data:`_FORENSICS_CATEGORIES`
-    (``MULTI_FIELD_SIGNAL`` > ``NAME_SIGNAL`` > ``ADDRESS_SIGNAL`` > ``NUMERIC_SIGNAL``
-    > ``VERY_LOW_SIGNAL``, first match wins) via three transparent boolean gates
-    (``strong_name_signal``/``strong_address_signal``/``strong_numeric_signal``,
-    each kept as its own column in the detail TSV) built from fixed, round similarity
-    thresholds (:data:`_STRONG_JACCARD`/:data:`_STRONG_JW`/:data:`_STRONG_TOKEN_SORT`/
-    :data:`_STRONG_OVERLAP`) -- never a learned or fitted score. These forensic
-    similarity numbers are diagnostic-only: this function never feeds them to
-    ``blocking.generate_candidates``, never adds them as a new blocking pass, and
-    changes no ``config.py``/``blocking.py``/``features.py``/``normalize.py``/
-    ``model.py`` default, threshold or K value.
-
-    Writes ``clean_fn_forensics.tsv`` (one row per clean blocking FN) and
-    ``summary.tsv`` (aggregate + per-country counts) under
-    ``artifacts/diagnostics/blocking_fn_forensics_<ts>/`` (plus a ``meta.json``
-    sidecar, mirroring this module's other diagnostics). Never touches ``output/``.
+    See :func:`run_blocking_fn_forensics` for what every column means and which
+    production functions each one reuses.
     """
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    out_dir = DIAG_DIR / f"blocking_fn_forensics_{ts}"
-    _log(f"blocking FN forensics: sample={sample}")
-
-    clean, _cands, prep, s1_country = _clean_blocking_fn_pairs(sample, use_embeddings)
-    _log(f"blocking FN forensics: {len(clean)} clean blocking FNs "
-        f"(stage=blocking_false_negative, all {len(edecomp.LOSS_KEYS)} "
-        f"representation-loss flags False)")
-
-    DIAG_DIR.mkdir(parents=True, exist_ok=True)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    detail_path = out_dir / "clean_fn_forensics.tsv"
-    summary_path = out_dir / "summary.tsv"
-
     if len(clean) == 0:
-        _log("blocking FN forensics: no clean blocking FNs in this sample -- nothing to inspect")
-        detail = pd.DataFrame()
-        summary = pd.DataFrame([{"metric": "total_clean_fns", "value": 0}])
-        detail.to_csv(detail_path, sep="\t", index=False)
-        summary.to_csv(summary_path, sep="\t", index=False)
-        return {"detail": detail, "summary": summary, "out_dir": str(out_dir)}
+        return pd.DataFrame()
 
     s1_frame, others_frame = prep["s1"], prep["others"]
     s1_pos = pd.Index(s1_frame[config.ID_COL]).get_indexer(clean["s1_id"])
@@ -2716,8 +2671,72 @@ def run_blocking_fn_forensics(sample: float = 0.0045, use_embeddings: bool = Tru
             row["forensic_category"] = "VERY_LOW_SIGNAL"
         rows.append(row)
 
-    detail = pd.DataFrame(rows)
+    return pd.DataFrame(rows)
+
+
+def run_blocking_fn_forensics(sample: float = 0.0045, use_embeddings: bool = True) -> dict:
+    """Measurement-only diagnostic: pair-level forensic measurements for the exact
+    "clean" blocking false negatives ``blocking-fn-attribution`` reports (true pairs
+    staged ``blocking_false_negative`` with every representation-loss flag False, so
+    every individual blocking pass provably missed them and no mechanical raw-vs-
+    normalised signal loss explains it either) -- investigating what these pairs
+    actually look like, field by field, so that possible new blocking signals can be
+    considered later from evidence rather than guesswork.
+
+    Reuses, unmodified: :func:`_clean_blocking_fn_pairs` (the exact same 97-pair set,
+    from the exact same deterministic sample and production-default classification
+    path, that ``blocking-fn-attribution`` reports -- never a newly regenerated
+    approximation of it) and ``features.pair_features`` (the exact production
+    pairwise-similarity implementation -- Jaro-Winkler, rapidfuzz ratio/partial/
+    token-sort, TF-IDF cosine, token Jaccard, digit/house/region equality -- fitted
+    via ``features.FeatureContext.fit`` on this sample's own S1+others exactly as
+    ``features.build_features`` does when given no context). The only similarity
+    numbers computed outside ``pair_features`` here are ones it does not already
+    expose: exact ``name_norm`` equality, address Jaro-Winkler (``pair_features`` only
+    has rapidfuzz ratio/token-set/token-sort/partial for address, not Jaro-Winkler),
+    token *overlap counts* (``pair_features`` has Jaccard but not the raw intersection
+    size) and the actual shared-token lists -- each a direct, undisputed
+    set/rapidfuzz computation on the same normalised fields, never a new formula.
+
+    Classifies each pair into exactly one of :data:`_FORENSICS_CATEGORIES`
+    (``MULTI_FIELD_SIGNAL`` > ``NAME_SIGNAL`` > ``ADDRESS_SIGNAL`` > ``NUMERIC_SIGNAL``
+    > ``VERY_LOW_SIGNAL``, first match wins) via three transparent boolean gates
+    (``strong_name_signal``/``strong_address_signal``/``strong_numeric_signal``,
+    each kept as its own column in the detail TSV) built from fixed, round similarity
+    thresholds (:data:`_STRONG_JACCARD`/:data:`_STRONG_JW`/:data:`_STRONG_TOKEN_SORT`/
+    :data:`_STRONG_OVERLAP`) -- never a learned or fitted score. These forensic
+    similarity numbers are diagnostic-only: this function never feeds them to
+    ``blocking.generate_candidates``, never adds them as a new blocking pass, and
+    changes no ``config.py``/``blocking.py``/``features.py``/``normalize.py``/
+    ``model.py`` default, threshold or K value.
+
+    Writes ``clean_fn_forensics.tsv`` (one row per clean blocking FN) and
+    ``summary.tsv`` (aggregate + per-country counts) under
+    ``artifacts/diagnostics/blocking_fn_forensics_<ts>/`` (plus a ``meta.json``
+    sidecar, mirroring this module's other diagnostics). Never touches ``output/``.
+    """
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    out_dir = DIAG_DIR / f"blocking_fn_forensics_{ts}"
+    _log(f"blocking FN forensics: sample={sample}")
+
+    clean, _cands, prep, s1_country = _clean_blocking_fn_pairs(sample, use_embeddings)
+    _log(f"blocking FN forensics: {len(clean)} clean blocking FNs "
+        f"(stage=blocking_false_negative, all {len(edecomp.LOSS_KEYS)} "
+        f"representation-loss flags False)")
+
+    DIAG_DIR.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    detail_path = out_dir / "clean_fn_forensics.tsv"
+    summary_path = out_dir / "summary.tsv"
+
+    detail = _fn_forensics_detail(clean, prep, s1_country)
     total = len(detail)
+    if total == 0:
+        _log("blocking FN forensics: no clean blocking FNs in this sample -- nothing to inspect")
+        summary = pd.DataFrame([{"metric": "total_clean_fns", "value": 0}])
+        detail.to_csv(detail_path, sep="\t", index=False)
+        summary.to_csv(summary_path, sep="\t", index=False)
+        return {"detail": detail, "summary": summary, "out_dir": str(out_dir)}
 
     def _pct(n: int, d: int) -> float:
         """Percentage of ``n`` over ``d``, 0.0 when ``d`` is 0."""
@@ -2815,6 +2834,1471 @@ def run_blocking_fn_forensics(sample: float = 0.0045, use_embeddings: bool = Tru
                 print(f"    {cat:<20}{cnt} / {n_c} ({_pct(cnt, n_c):.1f}%)")
 
     return {"detail": detail, "summary": summary, "out_dir": str(out_dir)}
+
+
+# --- blocking-address-pass key-level forensics ---------------------------------------------
+
+#: Mutually exclusive per-pair address-key forensic statuses, checked in this order.
+_ADDRESS_STATUS_ORDER = ("FOUND_IN_TOPK", "LOSES_TOPK", "FILTERED_BY_MAX_BLOCK",
+                         "NO_SHARED_KEY", "OTHER_ISSUE")
+
+
+def _address_pass_bundle(
+    s1_frame: pd.DataFrame, others_frame: pd.DataFrame,
+    within_country: bool = config.BLOCK_WITHIN_COUNTRY,
+) -> dict[str, dict]:
+    """Per-country-group forensic state for ``blocking.address_pass``, built from its
+    own unmodified production primitives (``blocking.country_groups``,
+    ``blocking._address_keys``, ``blocking.key_pass``), so that individual
+    (S1, candidate) pairs can be looked up against the *exact* key set, IDF weight and
+    ``config.ADDRESS_MAX_BLOCK`` filter production's own ``address_pass`` would have
+    used for that group -- without truncating to ``config.K_ADDRESS`` before the
+    lookup, so a pair that has a key but loses only to the top-K cut can be told apart
+    from one that never had a key at all.
+
+    For each group (production's own per-country groups when ``within_country``,
+    else a single ``"*"`` group), runs ``blocking.key_pass`` with ``k`` set to that
+    group's full candidate count -- i.e. every other production argument
+    (``max_block=config.ADDRESS_MAX_BLOCK``, ``idf_weight=True``, the same
+    ``_address_keys``-built key lists) identical to a real ``address_pass`` call,
+    only the final per-query top-k truncation is deferred so every pair's full,
+    max_block-filtered rank is recoverable.
+
+    Returns ``{group: {"q_id_to_local", "x_id_to_local", "q_keys", "x_keys",
+    "surviving_keys", "rank_of"}}`` where ``rank_of`` is a ``{(q_local, x_local):
+    rank}`` map (1 = best) over every pair that survives the max_block filter and
+    actually appears in the join, for every group with at least one candidate.
+    """
+    s1_frame = s1_frame.reset_index(drop=True)
+    others_frame = others_frame.reset_index(drop=True)
+    bundles: dict[str, dict] = {}
+    for country, q_idx, x_idx in country_groups(s1_frame, others_frame, within_country):
+        if len(x_idx) == 0:
+            continue
+        q = s1_frame.iloc[q_idx].reset_index(drop=True)
+        x = others_frame.iloc[x_idx].reset_index(drop=True)
+        words = pd.concat([q["addr_norm"], x["addr_norm"]]).str.split().explode()
+        word_df = words.value_counts()
+        q_keys = _address_keys(q, word_df)
+        x_keys = _address_keys(x, word_df)
+
+        xe = x_keys.explode().dropna()
+        x_key_df = pd.DataFrame({"x": xe.index.to_numpy(np.int64), "key": xe.to_numpy()}).drop_duplicates()
+        block_counts = x_key_df["key"].value_counts()
+        surviving_keys = set(block_counts[block_counts <= config.ADDRESS_MAX_BLOCK].index)
+
+        big_k = max(len(x_idx), 1)
+        full = key_pass(q_keys, x_keys, big_k, config.ADDRESS_MAX_BLOCK, idf_weight=True)
+        rank_of: dict[tuple[int, int], int] = {}
+        if len(full):
+            # `key_pass` itself truncates to k via
+            # `sort_values(["q","w","x"], ascending=[True, False, True]).groupby("q",
+            # sort=False).head(k)` -- i.e. the deterministic tiebreak on a tied score is
+            # ascending `x`, not an arbitrary/tied rank. Re-sorting this uncapped
+            # (``big_k``) result the same way and taking each row's 0-based position
+            # within its `q` group (+1) reproduces the exact position `head(K_ADDRESS)`
+            # would keep or cut, which `Series.rank(method="min")` does not: a tied
+            # score would give every tied row the same rank instead of the one
+            # position order the production truncation actually keeps.
+            ordered = full.sort_values(["q", "score", "x"], ascending=[True, False, True])
+            pos = ordered.groupby("q", sort=False).cumcount()
+            for qv, xv, pv in zip(ordered["q"], ordered["x"], pos):
+                rank_of[(int(qv), int(xv))] = int(pv) + 1
+
+        bundles[country] = {
+            "q_id_to_local": {sid: i for i, sid in enumerate(q[config.ID_COL])},
+            "x_id_to_local": {cid: i for i, cid in enumerate(x[config.ID_COL])},
+            "q_keys": q_keys, "x_keys": x_keys,
+            "surviving_keys": surviving_keys, "rank_of": rank_of,
+        }
+    return bundles
+
+
+def run_blocking_address_forensics(sample: float = 0.0045, use_embeddings: bool = True) -> dict:
+    """Measurement-only diagnostic: key-level forensics on ``blocking.address_pass``
+    for the "strong address similarity" clean blocking false negatives
+    ``blocking-fn-forensics`` reports (``strong_address_signal`` True in
+    :func:`_fn_forensics_detail`) -- the subset the evidence so far most strongly
+    points at as a *recoverable* blocking gap. For each such pair, determines exactly
+    why ``blocking.address_pass`` missed it: no shared production address key at all
+    (a key-construction gap), a shared key that ``config.ADDRESS_MAX_BLOCK`` dropped
+    before the join, a shared key that survived but lost the ``config.K_ADDRESS``
+    top-k cut, or (if none of those explain it) an unresolved inconsistency worth a
+    closer look.
+
+    Reuses, unmodified: :func:`_clean_blocking_fn_pairs` and
+    :func:`_fn_forensics_detail` (the exact same clean-FN pair set and
+    ``strong_address_signal``/``region_equal``/``s1_digits``/``cand_digits`` columns
+    ``blocking-fn-forensics`` reports -- filtered here, never regenerated), and
+    ``blocking.country_groups``/``blocking._address_keys``/``blocking.key_pass``
+    (via :func:`_address_pass_bundle`) -- the exact production address-key
+    construction, IDF weighting and ``ADDRESS_MAX_BLOCK`` filter, at production
+    ``config.K_ADDRESS``/``config.ADDRESS_MAX_BLOCK`` defaults, never approximated.
+
+    This is purely diagnostic measurement: it never calls
+    ``blocking.generate_candidates``, never feeds a key back into candidate
+    generation, and changes no ``config.py``/``blocking.py`` default, threshold or
+    K value.
+
+    Writes ``address_fn_forensics.tsv`` (one row per strong-address clean FN) and
+    ``summary.tsv`` under ``artifacts/diagnostics/blocking_address_forensics_<ts>/``
+    (plus a ``meta.json`` sidecar). Never touches ``output/``.
+    """
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    out_dir = DIAG_DIR / f"blocking_address_forensics_{ts}"
+    _log(f"blocking address forensics: sample={sample}")
+
+    clean, _cands, prep, s1_country = _clean_blocking_fn_pairs(sample, use_embeddings)
+    fn_detail = _fn_forensics_detail(clean, prep, s1_country)
+    if len(fn_detail):
+        strong = fn_detail[fn_detail["strong_address_signal"]].reset_index(drop=True)
+    else:
+        strong = fn_detail
+    _log(f"blocking address forensics: {len(strong)} / {len(fn_detail)} clean blocking FNs "
+        f"have strong address similarity")
+
+    DIAG_DIR.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    detail_path = out_dir / "address_fn_forensics.tsv"
+    summary_path = out_dir / "summary.tsv"
+
+    if len(strong) == 0:
+        _log("blocking address forensics: no strong-address clean blocking FNs -- nothing to inspect")
+        detail = pd.DataFrame()
+        summary = pd.DataFrame([{"metric": "total_strong_address_fns", "value": 0}])
+        detail.to_csv(detail_path, sep="\t", index=False)
+        summary.to_csv(summary_path, sep="\t", index=False)
+        return {"detail": detail, "summary": summary, "out_dir": str(out_dir)}
+
+    s1_frame, others_frame = prep["s1"], prep["others"]
+    within_country = config.BLOCK_WITHIN_COUNTRY
+    bundles = _address_pass_bundle(s1_frame, others_frame, within_country)
+    others_country = dict(zip(others_frame[config.ID_COL], others_frame[config.COUNTRY_COL]))
+
+    rows = []
+    for i in range(len(strong)):
+        s1_id, cand_id = strong["s1_id"].iat[i], strong["cand_id"].iat[i]
+        group_key = s1_country.get(s1_id, "") if within_country else "*"
+        cand_country = others_country.get(cand_id, "")
+        same_country = (s1_country.get(s1_id, "") == cand_country)
+        bundle = bundles.get(group_key)
+
+        row: dict = {
+            "s1_id": s1_id, "cand_id": cand_id, "country": s1_country.get(s1_id, ""),
+            "same_country": bool(same_country),
+            "region_match": strong["region_equal"].iat[i],
+            "s1_digits": strong["s1_digits"].iat[i], "cand_digits": strong["cand_digits"].iat[i],
+        }
+
+        q_local = bundle["q_id_to_local"].get(s1_id) if bundle else None
+        # Eligible for this S1's own address_pass group iff the candidate is grouped
+        # under the same key (== same country, when within_country, exactly as
+        # `country_groups`/`generate_candidates` restrict `x` to that group).
+        x_local = bundle["x_id_to_local"].get(cand_id) if (bundle and same_country) else None
+
+        if bundle is not None and q_local is not None and x_local is not None:
+            s1_keys = set(bundle["q_keys"].iat[q_local])
+            cand_keys = set(bundle["x_keys"].iat[x_local])
+            shared = s1_keys & cand_keys
+            surviving_shared = shared & bundle["surviving_keys"]
+            rank = bundle["rank_of"].get((q_local, x_local))
+
+            key_exists = bool(shared)
+            key_filtered = key_exists and not surviving_shared
+            in_topk = rank is not None and rank <= config.K_ADDRESS
+            if not key_exists:
+                status = "NO_SHARED_KEY"
+            elif key_filtered:
+                status = "FILTERED_BY_MAX_BLOCK"
+            elif in_topk:
+                status = "FOUND_IN_TOPK"
+            elif rank is not None:
+                status = "LOSES_TOPK"
+            else:
+                status = "OTHER_ISSUE"
+
+            row["s1_address_keys"] = ",".join(sorted(s1_keys))
+            row["cand_address_keys"] = ",".join(sorted(cand_keys))
+            row["shared_address_keys"] = ",".join(sorted(shared))
+            row["key_exists"] = key_exists
+            row["key_filtered_by_max_block"] = key_filtered
+            row["true_pair_in_address_pass"] = in_topk
+            row["address_topk_rank_if_shared"] = float(rank) if rank is not None else np.nan
+            row["address_forensic_status"] = status
+        else:
+            # Structurally ineligible for this S1's own address_pass group (only
+            # possible when `not same_country` under `within_country=True`, since
+            # `country_groups` restricts that group's `x` to the S1's own country) --
+            # `address_pass` never even compares this pair, so no key/rank exists to
+            # report; keys are still generated independently (each side against its
+            # own country's word_df) purely so the raw key text is visible for
+            # inspection, never as a stand-in for a production comparison.
+            cand_bundle = bundles.get(cand_country) if not same_country else None
+            s1_keys = (set(bundle["q_keys"].iat[q_local])
+                      if bundle is not None and q_local is not None else set())
+            cand_keys = (set(cand_bundle["x_keys"].iat[cand_bundle["x_id_to_local"][cand_id]])
+                        if cand_bundle is not None and cand_id in cand_bundle["x_id_to_local"] else set())
+            row["s1_address_keys"] = ",".join(sorted(s1_keys))
+            row["cand_address_keys"] = ",".join(sorted(cand_keys))
+            row["shared_address_keys"] = ",".join(sorted(s1_keys & cand_keys))
+            row["key_exists"] = False
+            row["key_filtered_by_max_block"] = False
+            row["true_pair_in_address_pass"] = False
+            row["address_topk_rank_if_shared"] = np.nan
+            row["address_forensic_status"] = "NO_SHARED_KEY"
+        rows.append(row)
+
+    detail = pd.DataFrame(rows)
+    total = len(detail)
+
+    def _pct(n: int, d: int) -> float:
+        """Percentage of ``n`` over ``d``, 0.0 when ``d`` is 0."""
+        return (n / d * 100.0) if d else 0.0
+
+    status_counts = detail["address_forensic_status"].value_counts().to_dict()
+    shared_key_count = int(detail["key_exists"].sum())
+    no_shared_key_count = total - shared_key_count
+    filtered_count = int(status_counts.get("FILTERED_BY_MAX_BLOCK", 0))
+    loses_topk_count = int(status_counts.get("LOSES_TOPK", 0))
+    other_issue_count = int(status_counts.get("OTHER_ISSUE", 0))
+    found_in_topk_count = int(status_counts.get("FOUND_IN_TOPK", 0))
+    recoverable_count = filtered_count + loses_topk_count
+    blind_count = no_shared_key_count
+
+    if found_in_topk_count:
+        _log(f"WARNING: {found_in_topk_count} strong-address clean FN(s) were actually found "
+            f"within address_pass's own K_ADDRESS top-k in this re-run -- inconsistent with "
+            f"blocking-fn-attribution's retrieved_address=0 result for the same sample; see "
+            f"{detail_path.name}.")
+    if other_issue_count:
+        _log(f"WARNING: {other_issue_count} strong-address clean FN(s) have a shared address "
+            f"key that survives ADDRESS_MAX_BLOCK but never appears in the address_pass join "
+            f"at all -- an unexplained inconsistency worth investigating directly; see "
+            f"{detail_path.name}.")
+
+    agg = {
+        "total_strong_address_fns": total,
+        "shared_production_address_key": shared_key_count,
+        "no_shared_production_key": no_shared_key_count,
+        "key_exists_but_filtered": filtered_count,
+        "key_survives_but_loses_topk": loses_topk_count,
+        "key_generated_but_other_issue": other_issue_count,
+        "found_in_topk": found_in_topk_count,
+        "address_blocker_recoverable": recoverable_count,
+        "address_blocker_structurally_blind": blind_count,
+    }
+    summary_rows = [{"metric": k, "value": v} for k, v in agg.items()]
+    for status in _ADDRESS_STATUS_ORDER:
+        cnt = int(status_counts.get(status, 0))
+        summary_rows.append({"metric": f"status_{status}_count", "value": cnt})
+        summary_rows.append({"metric": f"status_{status}_pct", "value": _pct(cnt, total)})
+
+    for country, g in detail.groupby("country"):
+        n_c = len(g)
+        g_status_counts = g["address_forensic_status"].value_counts().to_dict()
+        g_shared = int(g["key_exists"].sum())
+        prefix = f"country_{country}_"
+        summary_rows.append({"metric": f"{prefix}total_strong_address_fns", "value": n_c})
+        summary_rows.append({"metric": f"{prefix}shared_production_address_key", "value": g_shared})
+        summary_rows.append({"metric": f"{prefix}no_shared_production_key", "value": n_c - g_shared})
+        for status in _ADDRESS_STATUS_ORDER:
+            summary_rows.append({"metric": f"{prefix}status_{status}_count",
+                                "value": int(g_status_counts.get(status, 0))})
+    summary = pd.DataFrame(summary_rows)
+
+    detail.to_csv(detail_path, sep="\t", index=False)
+    summary.to_csv(summary_path, sep="\t", index=False)
+    meta = {
+        "kind": "blocking_address_forensics", "timestamp": ts, "sample": sample,
+        "use_embeddings": use_embeddings, "git_commit": rp._git_hash(),
+        "dataset_file_hashes": diag.dataset_file_hashes(config.TRAIN_FILES),
+        "env": diag.env_info(), "n_strong_address_fns": total,
+        "n_clean_fns_total": len(fn_detail),
+        "k_address": config.K_ADDRESS, "address_max_block": config.ADDRESS_MAX_BLOCK,
+    }
+    diag.save_json(meta, out_dir / "meta.json")
+    _log(f"blocking address forensics written under {out_dir}")
+
+    print(f"\n{total} strong-address pairs\n")
+    print(f"shared production address key:       {shared_key_count} / {total} "
+        f"({_pct(shared_key_count, total):.1f}%)")
+    print(f"no shared production key:            {no_shared_key_count} / {total} "
+        f"({_pct(no_shared_key_count, total):.1f}%)\n")
+    print(f"key exists but filtered:              {filtered_count} / {total} "
+        f"({_pct(filtered_count, total):.1f}%)")
+    print(f"key survives but loses top-K:         {loses_topk_count} / {total} "
+        f"({_pct(loses_topk_count, total):.1f}%)")
+    print(f"key generated but other issue:        {other_issue_count} / {total} "
+        f"({_pct(other_issue_count, total):.1f}%)")
+    if found_in_topk_count:
+        print(f"(already found in top-K, unexpectedly): {found_in_topk_count} / {total}")
+    print(f"\naddress blocker recoverable:          {recoverable_count} / {total} "
+        f"({_pct(recoverable_count, total):.1f}%)")
+    print(f"address blocker structurally blind:  {blind_count} / {total} "
+        f"({_pct(blind_count, total):.1f}%)")
+    print("\nBy country:")
+    for country, g in detail.groupby("country"):
+        n_c = len(g)
+        g_shared = int(g["key_exists"].sum())
+        print(f"  {country}: n={n_c}, shared_key={g_shared} ({_pct(g_shared, n_c):.1f}%)")
+        g_status_counts = g["address_forensic_status"].value_counts().to_dict()
+        for status in _ADDRESS_STATUS_ORDER:
+            cnt = int(g_status_counts.get(status, 0))
+            if cnt:
+                print(f"    {status:<24}{cnt} / {n_c} ({_pct(cnt, n_c):.1f}%)")
+
+    return {"detail": detail, "summary": summary, "out_dir": str(out_dir)}
+
+
+# --- D2: blocking key counterfactuals ------------------------------------------------------
+
+#: Digit tokens per record used by the multi-digit key schemes below.
+_CF_MAX_DIGITS = 4
+#: Rarest street words / name tokens per record used by the key schemes below.
+_CF_RARE = 2
+#: Block-size cap for the "open" (reachability) run: large enough that almost no key
+#: is filtered at sample scale, small enough to bound the join.
+_CF_OPEN_MAX_BLOCK = 5000
+
+
+def _cf_street_words(addr: str, word_df: dict[str, int]) -> list[str]:
+    """Distinct alphabetic address words (len >= 3, not address stopwords), rarest
+    first -- the same word filter production ``blocking._address_keys`` applies."""
+    words = list(dict.fromkeys(w for w in addr.split()
+                               if len(w) >= 3 and w.isalpha() and w not in _ADDRESS_STOPWORDS))
+    words.sort(key=lambda w: (word_df.get(w, 0), w))
+    return words
+
+
+def _cf_name_tokens(name_core: str, name_df: dict[str, int]) -> list[str]:
+    """Distinct name_core tokens (len >= 2), rarest first."""
+    toks = list(dict.fromkeys(t for t in name_core.split() if len(t) >= 2))
+    toks.sort(key=lambda t: (name_df.get(t, 0), t))
+    return toks
+
+
+def _cf_scheme_keys(scheme: str, frame: pd.DataFrame, word_df: dict[str, int],
+                    name_df: dict[str, int]) -> pd.Series:
+    """Per-record key lists for one counterfactual blocking-key scheme.
+
+    Schemes (none of them is used by production; ``prod_address`` reproduces the
+    production address pass exactly and serves as the sanity check):
+
+    * ``prod_address``: production ``blocking._address_keys`` (anchored on the first
+      digit token only).
+    * ``all_digit_word``: ``digit@word`` for every one of the first
+      ``_CF_MAX_DIGITS`` digit tokens x the ``_CF_RARE`` rarest street words.
+    * ``digit_pair_set``: unordered pairs of the first ``_CF_MAX_DIGITS`` digit tokens.
+    * ``postal_word``: every >=5-digit token (ZIP/PIN) x rarest street words.
+    * ``street_word_pair``: unordered pairs of the 3 rarest street words (no digit
+      needed, so digit-less addresses get keys).
+    * ``digit_name_any``: every digit token x the rarest name tokens (production's
+      digit pass requires the *first* name token instead).
+    * ``name_region``: rarest name tokens x (postal tokens + region codes).
+    """
+    if scheme == "prod_address":
+        return _address_keys(frame, pd.Series(word_df, dtype=np.int64))
+    out = []
+    for addr, digits, long_nums, region, core in zip(
+            frame["addr_norm"], frame["digits"], frame["long_nums"], frame["region"],
+            frame["name_core"]):
+        ds = digits.split()[:_CF_MAX_DIGITS]
+        if scheme == "all_digit_word":
+            words = _cf_street_words(addr, word_df)[:_CF_RARE]
+            ks = [f"{d}@{w}" for d in ds for w in words]
+        elif scheme == "digit_pair_set":
+            ks = [f"{a}#{b}" if a < b else f"{b}#{a}"
+                  for i, a in enumerate(ds) for b in ds[i + 1:]]
+        elif scheme == "postal_word":
+            words = _cf_street_words(addr, word_df)[:_CF_RARE]
+            ks = [f"{p}@{w}" for p in long_nums.split() for w in words]
+        elif scheme == "street_word_pair":
+            words = _cf_street_words(addr, word_df)[:3]
+            ks = [f"{a}+{b}" if a < b else f"{b}+{a}"
+                  for i, a in enumerate(words) for b in words[i + 1:]]
+        elif scheme == "digit_name_any":
+            toks = _cf_name_tokens(core, name_df)[:_CF_RARE]
+            ks = [f"{d}|{t}" for d in ds for t in toks]
+        elif scheme == "name_region":
+            toks = _cf_name_tokens(core, name_df)[:_CF_RARE]
+            ctx = long_nums.split() + region.split()
+            ks = [f"{t}^{c}" for t in toks for c in ctx]
+        else:
+            raise ValueError(f"unknown counterfactual scheme {scheme!r}")
+        out.append(list(dict.fromkeys(ks)))
+    return pd.Series(out, dtype=object)
+
+
+CF_SCHEMES = ("prod_address", "all_digit_word", "digit_pair_set", "postal_word",
+              "street_word_pair", "digit_name_any", "name_region")
+
+
+def _true_pair_frame(prep: dict, truth: dict[str, list[str]]) -> pd.DataFrame:
+    """Every true (s1_id, cand_id) pair whose both sides are in ``prep``, with country."""
+    others = set(prep["others"][config.ID_COL])
+    country = dict(zip(prep["s1"][config.ID_COL], prep["s1"][config.COUNTRY_COL]))
+    rows = [(s, c, country[s]) for s in prep["s1"][config.ID_COL]
+            for c in truth.get(s, ()) if c in others]
+    return pd.DataFrame(rows, columns=["s1_id", "cand_id", "country"])
+
+
+def _latest_clean_fn_keys() -> set[tuple[str, str]]:
+    """``(s1_id, cand_id)`` of the most recent ``blocking-fn-attribution`` run's clean
+    blocking FNs, or an empty set when none exists. Used only to label rows."""
+    runs = sorted(DIAG_DIR.glob("blocking_fn_attribution_*/clean_blocking_fn_attribution.tsv"))
+    if not runs:
+        return set()
+    df = pd.read_csv(runs[-1], sep="\t", dtype=str, keep_default_na=False)
+    return set(zip(df["s1_id"], df["cand_id"]))
+
+
+def run_blocking_key_counterfactual(sample: float = 0.0045, use_embeddings: bool = True,
+                                    schemes: tuple[str, ...] = CF_SCHEMES) -> dict:
+    """D2 (measurement-only): would alternative blocking keys retrieve the true pairs
+    the production candidate union misses, and at what candidate cost?
+
+    For the deterministic ``--sample`` it builds the production union
+    (``run_pipeline.prepare`` + ``run_pipeline.block``, unmodified) and the set of
+    *missed* true pairs (every true pair in scope that is absent from the union; not
+    only the validation split). Then, per ``blocking.country_groups`` group, it runs
+    each key scheme of :func:`_cf_scheme_keys` through the unmodified production
+    ``blocking.key_pass`` twice:
+
+    * **production settings** (``k=K_ADDRESS``, ``max_block=ADDRESS_MAX_BLOCK``): the
+      pairs the scheme would add if it were deployed as an extra pass. Reports
+      recovered missed pairs and *added* pairs (not already in the union).
+    * **open** (``k`` unbounded, ``max_block=_CF_OPEN_MAX_BLOCK``) restricted to the
+      S1s that own a missed pair: whether the scheme's keys are shared at all
+      (reachable) and the true pair's rank among that S1's key matches.
+
+    ``prod_address`` must reproduce the production address pass pair count exactly
+    (logged as ``sanity_prod_address_matches_production``).
+
+    Writes ``summary.tsv`` (per scheme x country), ``missed_pairs.tsv`` (per missed
+    pair x scheme flags) and ``meta.json`` under
+    ``artifacts/diagnostics/blocking_key_counterfactual_<ts>/``. Never modifies
+    production code, configuration or ``output/``.
+    """
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    out_dir = DIAG_DIR / f"blocking_key_counterfactual_{ts}"
+    t_start = time.time()
+    s1, s2, s3, truth = rp._load_train(sample)
+    prep = rp.prepare(s1, s2, s3, use_embeddings)
+    del s1, s2, s3
+    cands = rp.block(prep)
+    s1f, xf = prep["s1"].reset_index(drop=True), prep["others"].reset_index(drop=True)
+    union = set(zip(cands["s1_id"], cands["cand_id"]))
+    tp = _true_pair_frame(prep, truth)
+    tp["in_union"] = [(s, c) in union for s, c in zip(tp["s1_id"], tp["cand_id"])]
+    missed = tp[~tp["in_union"]].reset_index(drop=True)
+    clean_keys = _latest_clean_fn_keys()
+    missed["is_clean_fn"] = [(s, c) in clean_keys for s, c in zip(missed["s1_id"], missed["cand_id"])]
+    missed_key = set(zip(missed["s1_id"], missed["cand_id"]))
+    missed_s1 = set(missed["s1_id"])
+    _log(f"key counterfactual: {len(tp):,} true pairs, {len(missed):,} missed by the "
+         f"production union ({len(cands):,} pairs); {int(missed['is_clean_fn'].sum())} "
+         f"match the latest clean-FN list")
+
+    s1_ids, x_ids = s1f[config.ID_COL].to_numpy(), xf[config.ID_COL].to_numpy()
+    prod_address_pairs = int(((cands["passes"].to_numpy() & PASS_BITS["address"]) > 0).sum())
+    rows, flags = [], {sch: {} for sch in schemes}
+    scheme_pairs: dict[str, set] = {sch: set() for sch in schemes}
+    for country, q_idx, x_idx in country_groups(s1f, xf, config.BLOCK_WITHIN_COUNTRY):
+        if len(x_idx) == 0:
+            continue
+        q, x = s1f.iloc[q_idx].reset_index(drop=True), xf.iloc[x_idx].reset_index(drop=True)
+        word_df = pd.concat([q["addr_norm"], x["addr_norm"]]).str.split().explode().value_counts()
+        name_df = pd.concat([q["name_core"], x["name_core"]]).str.split().explode().value_counts()
+        word_df, name_df = word_df.to_dict(), name_df.to_dict()
+        q_is_target = np.array([s in missed_s1 for s in s1_ids[q_idx]])
+        for sch in schemes:
+            t0 = time.time()
+            qk = _cf_scheme_keys(sch, q, word_df, name_df)
+            xk = _cf_scheme_keys(sch, x, word_df, name_df)
+            prod = key_pass(qk, xk, config.K_ADDRESS, config.ADDRESS_MAX_BLOCK)
+            pairs = set(zip(s1_ids[q_idx[prod["q"].to_numpy()]], x_ids[x_idx[prod["x"].to_numpy()]]))
+            scheme_pairs[sch] |= pairs
+            qk_open = pd.Series([ks if t else [] for ks, t in zip(qk, q_is_target)], dtype=object)
+            opn = key_pass(qk_open, xk, 10 ** 9, _CF_OPEN_MAX_BLOCK)
+            opn = opn.assign(rank=opn.groupby("q", sort=False).cumcount() + 1)
+            for sid, cid, rk in zip(s1_ids[q_idx[opn["q"].to_numpy()]],
+                                    x_ids[x_idx[opn["x"].to_numpy()]], opn["rank"].to_numpy()):
+                if (sid, cid) in missed_key:
+                    flags[sch][(sid, cid)] = int(rk)
+            g_missed = missed[missed["country"] == country]
+            g_keys = list(zip(g_missed["s1_id"], g_missed["cand_id"]))
+            g_tp = tp[tp["country"] == country]
+            rows.append({
+                "scheme": sch, "country": country,
+                "records_with_keys_pct": 100.0 * float((qk.map(len) > 0).mean()) if len(qk) else 0.0,
+                "pairs_at_prod_settings": len(pairs),
+                "added_pairs_vs_union": len(pairs - union),
+                "standalone_true_pair_recall_pct": 100.0 * sum(
+                    (s, c) in pairs for s, c in zip(g_tp["s1_id"], g_tp["cand_id"])) / max(len(g_tp), 1),
+                "missed_pairs": len(g_keys),
+                "missed_recovered_at_prod_settings": sum(k in pairs for k in g_keys),
+                "missed_reachable_open": sum(k in flags[sch] for k in g_keys),
+                "clean_missed": int(g_missed["is_clean_fn"].sum()),
+                "clean_recovered_at_prod_settings": sum(
+                    k in pairs for k, c in zip(g_keys, g_missed["is_clean_fn"]) if c),
+                "seconds": round(time.time() - t0, 1),
+            })
+            _log(f"{country} {sch}: +{rows[-1]['added_pairs_vs_union']:,} pairs, "
+                 f"recovered {rows[-1]['missed_recovered_at_prod_settings']}/{len(g_keys)}")
+
+    new = [s for s in schemes if s != "prod_address"]
+    all_new = set().union(*(scheme_pairs[s] for s in new)) if new else set()
+    for label, pairs in [("ALL_NEW_UNION", all_new)]:
+        rows.append({
+            "scheme": label, "country": "ALL", "pairs_at_prod_settings": len(pairs),
+            "added_pairs_vs_union": len(pairs - union),
+            "missed_pairs": len(missed),
+            "missed_recovered_at_prod_settings": sum(k in pairs for k in missed_key),
+            "clean_missed": int(missed["is_clean_fn"].sum()),
+            "clean_recovered_at_prod_settings": sum(
+                (s, c) in pairs for s, c, f in zip(missed["s1_id"], missed["cand_id"],
+                                                   missed["is_clean_fn"]) if f),
+        })
+    summary = pd.DataFrame(rows)
+    for sch in schemes:
+        missed[f"{sch}_prod"] = [(s, c) in scheme_pairs[sch]
+                                 for s, c in zip(missed["s1_id"], missed["cand_id"])]
+        missed[f"{sch}_open_rank"] = [flags[sch].get((s, c), np.nan)
+                                      for s, c in zip(missed["s1_id"], missed["cand_id"])]
+    sanity = len(scheme_pairs.get("prod_address", set())) == prod_address_pairs \
+        if "prod_address" in schemes else None
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    summary.to_csv(out_dir / "summary.tsv", sep="\t", index=False)
+    missed.to_csv(out_dir / "missed_pairs.tsv", sep="\t", index=False)
+    diag.save_json({
+        "kind": "blocking_key_counterfactual", "timestamp": ts, "sample": sample,
+        "use_embeddings": use_embeddings, "git_commit": rp._git_hash(),
+        "env": diag.env_info(), "n_true_pairs": len(tp), "n_missed": len(missed),
+        "n_union_pairs": len(cands), "prod_address_pairs_in_union": prod_address_pairs,
+        "sanity_prod_address_matches_production": sanity,
+        "k": config.K_ADDRESS, "max_block": config.ADDRESS_MAX_BLOCK,
+        "open_max_block": _CF_OPEN_MAX_BLOCK, "seconds": round(time.time() - t_start, 1),
+    }, out_dir / "meta.json")
+    _log(f"key counterfactual written under {out_dir} (sanity={sanity})")
+    print(summary.to_string(index=False))
+    return {"summary": summary, "missed": missed, "out_dir": str(out_dir), "sanity": sanity}
+
+
+# --- D4: density stress --------------------------------------------------------------------
+
+def _rss_gib() -> tuple[float, float]:
+    """``(current, peak)`` resident memory of this process in GiB via psutil.
+
+    Peak is the OS high-water mark (``peak_wset`` on Windows, ``ru_maxrss``-equivalent
+    fields elsewhere when psutil exposes them; NaN when unavailable).
+    """
+    import psutil
+    mi = psutil.Process().memory_info()
+    peak = getattr(mi, "peak_wset", None)
+    return mi.rss / 2 ** 30, (peak / 2 ** 30) if peak else float("nan")
+
+
+def _full_norm_cache(name: str, expected_rows: int | None = None) -> Path:
+    """Path of the full-scale ``norm_<name>_*.parquet`` cache (the largest one).
+
+    Raises when none exists or when ``expected_rows`` is given and differs, so a
+    partial cache can never masquerade as the full source.
+    """
+    import pyarrow.parquet as pq
+    paths = sorted(config.ARTIFACTS_DIR.glob(f"norm_{name}_*.parquet"),
+                   key=lambda p: p.stat().st_size)
+    if not paths:
+        raise FileNotFoundError(f"no normalisation cache for {name}; run a full-scale "
+                                f"prepare first")
+    path = paths[-1]
+    n = pq.ParquetFile(path).metadata.num_rows
+    if expected_rows is not None and n != expected_rows:
+        raise ValueError(f"{path.name} has {n:,} rows, expected {expected_rows:,}")
+    return path
+
+
+def _hash_fraction(ids: pd.Series) -> np.ndarray:
+    """Deterministic per-ID value in [0, 1): nested selection across fractions."""
+    h = pd.util.hash_pandas_object(ids, index=False, hash_key="densitystress000").to_numpy()
+    return (h % np.uint64(1_000_000)).astype(np.float64) / 1_000_000.0
+
+
+def _distractors(frac: float, exclude: set[str], columns: list[str]) -> pd.DataFrame:
+    """Hash-selected ``frac`` of every full-scale S2+S3 normalised record not in
+    ``exclude``, read batch-wise from the full normalisation caches so the full
+    10M-row frame is never materialised."""
+    import pyarrow.parquet as pq
+    parts = []
+    for name in ("s2", "s3"):
+        pf = pq.ParquetFile(_full_norm_cache(name))
+        for batch in pf.iter_batches(batch_size=500_000, columns=columns):
+            df = batch.to_pandas()
+            keep = (_hash_fraction(df[config.ID_COL]) < frac) & ~df[config.ID_COL].isin(exclude)
+            if keep.any():
+                parts.append(df[keep])
+    return (pd.concat(parts, ignore_index=True) if parts
+            else pd.DataFrame(columns=columns))
+
+
+DENSITY_FRACTIONS = (0.0, 0.02, 0.1, 0.25)
+
+
+def _counterfactual_pair_sets(s1f: pd.DataFrame, others: pd.DataFrame) -> dict[str, set]:
+    """``{pass_name: {(s1_id, cand_id), ...}}`` for the three counterfactual passes:
+    char TF-IDF on ``name_core + addr_norm`` (production ``tfidf_name_pass`` at
+    ``K_TFIDF_NAME``) and the ``all_digit_word`` / ``street_word_pair`` key schemes
+    (production ``key_pass`` at ``K_ADDRESS`` / ``ADDRESS_MAX_BLOCK``), per
+    ``country_groups`` group, plus ``cf_all_three`` (their union)."""
+    s1f, others = s1f.reset_index(drop=True), others.reset_index(drop=True)
+    s1_ids, x_ids = s1f[config.ID_COL].to_numpy(), others[config.ID_COL].to_numpy()
+    found: dict[str, set] = {"cf_name_addr_tfidf": set(), "cf_all_digit_word": set(),
+                             "cf_street_word_pair": set()}
+    for _c, q_idx, x_idx in country_groups(s1f, others, config.BLOCK_WITHIN_COUNTRY):
+        if len(x_idx) == 0:
+            continue
+        q, x = s1f.iloc[q_idx].reset_index(drop=True), others.iloc[x_idx].reset_index(drop=True)
+        res = {"cf_name_addr_tfidf": tfidf_name_pass(q["name_core"] + " " + q["addr_norm"],
+                                                     x["name_core"] + " " + x["addr_norm"],
+                                                     k=config.K_TFIDF_NAME)}
+        word_df = pd.concat([q["addr_norm"], x["addr_norm"]]).str.split().explode().value_counts().to_dict()
+        for sch in ("all_digit_word", "street_word_pair"):
+            res[f"cf_{sch}"] = key_pass(_cf_scheme_keys(sch, q, word_df, {}),
+                                        _cf_scheme_keys(sch, x, word_df, {}),
+                                        config.K_ADDRESS, config.ADDRESS_MAX_BLOCK)
+        for name, r in res.items():
+            found[name] |= set(zip(s1_ids[q_idx[r["q"].to_numpy()]], x_ids[x_idx[r["x"].to_numpy()]]))
+    found["cf_all_three"] = set().union(*found.values())
+    return found
+
+
+def _density_counterfactuals(s1f: pd.DataFrame, others: pd.DataFrame, tp: pd.DataFrame,
+                             union: set) -> dict:
+    """Counterfactual passes for :func:`run_density_stress` at one index density
+    (see :func:`_counterfactual_pair_sets`). Returns standalone recall, pairs added to
+    ``union`` and union+pass recall for each pass and their union."""
+    found = _counterfactual_pair_sets(s1f, others)
+    true_keys = list(zip(tp["s1_id"], tp["cand_id"]))
+    out = {}
+    for name, pairs in found.items():
+        out[f"{name}_recall_pct"] = 100.0 * sum(k in pairs for k in true_keys) / len(true_keys)
+        out[f"{name}_added_pairs"] = len(pairs - union)
+        out[f"{name}_union_plus_recall_pct"] = 100.0 * sum(
+            k in pairs or k in union for k in true_keys) / len(true_keys)
+    return out
+
+
+#: Production configurations compared by ``fix-variants``: name -> config overrides.
+#: Every variant runs the unmodified production valid path with these flags set.
+FIX_VARIANTS: dict[str, dict] = {
+    "baseline": {},
+    "addr_all_digits": {"ADDRESS_KEY_MODE": "all"},
+    "street_pass": {"USE_STREET_PASS": True},
+    "digit_runs": {"BLOCK_DIGIT_SOURCE": "runs"},
+    "tfidf_addr_k20": {"USE_TFIDF_ADDR_PASS": True, "K_TFIDF_ADDR": 20},
+    "tfidf_addr_k10": {"USE_TFIDF_ADDR_PASS": True, "K_TFIDF_ADDR": 10},
+    "combined_k20": {"ADDRESS_KEY_MODE": "all", "USE_STREET_PASS": True,
+                     "BLOCK_DIGIT_SOURCE": "runs", "USE_TFIDF_ADDR_PASS": True,
+                     "K_TFIDF_ADDR": 20},
+    "combined_k10": {"ADDRESS_KEY_MODE": "all", "USE_STREET_PASS": True,
+                     "BLOCK_DIGIT_SOURCE": "runs", "USE_TFIDF_ADDR_PASS": True,
+                     "K_TFIDF_ADDR": 10},
+    "combined_k10_mem": {"ADDRESS_KEY_MODE": "all", "USE_STREET_PASS": True,
+                         "BLOCK_DIGIT_SOURCE": "runs", "USE_TFIDF_ADDR_PASS": True,
+                         "K_TFIDF_ADDR": 10, "FEATURE_CHUNK": 250_000},
+}
+
+
+class config_overrides:
+    """Context manager: temporarily set ``config`` attributes, always restoring them."""
+
+    def __init__(self, overrides: dict):
+        """Store the overrides to apply."""
+        self.overrides = overrides
+        self.saved: dict = {}
+
+    def __enter__(self):
+        """Apply overrides (unknown names raise, so a typo cannot silently no-op)."""
+        for k, v in self.overrides.items():
+            if not hasattr(config, k):
+                raise AttributeError(f"config has no attribute {k!r}")
+            self.saved[k] = getattr(config, k)
+            setattr(config, k, v)
+        return self
+
+    def __exit__(self, *exc):
+        """Restore every overridden value."""
+        for k, v in self.saved.items():
+            setattr(config, k, v)
+        return False
+
+
+def run_fix_variants(sample: float = 0.0045, variants: tuple[str, ...] = tuple(FIX_VARIANTS),
+                     use_embeddings: bool = True) -> pd.DataFrame:
+    """Production-fix validation: run each :data:`FIX_VARIANTS` configuration through
+    the unmodified production valid path (:func:`run_valid_for_diagnostics`: prepare
+    -> ``run_pipeline.block`` -> ``build_features`` -> GroupKFold OOF + τ -> fixed
+    ``split_s1`` validation) on the same deterministic sample, and report blocking,
+    quality, error-decomposition, RSS and runtime per variant.
+
+    Error counts reuse ``error_decomposition`` (``classify_true_pairs``,
+    ``false_positive_report``, ``one_to_one_removals``) exactly as ``errors`` does.
+    Config is restored after every variant. Writes ``fix_variants_<ts>.tsv`` +
+    ``.json`` under ``artifacts/diagnostics/``.
+    """
+    s1, s2, s3, truth = rp._load_train(sample)
+    rows = []
+    for name in variants:
+        overrides = FIX_VARIANTS[name]
+        t0 = time.time()
+        with config_overrides(overrides), _PeakSampler(interval=0.05) as mem:
+            ctx = run_valid_for_diagnostics(s1, s2, s3, truth, use_embeddings)
+            prep, cands, scored, pred = ctx["prep"], ctx["cands"], ctx["scored"], ctx["pred"]
+            s1_ids = list(prep["s1"][config.ID_COL])
+            s1_country = dict(zip(s1_ids, prep["s1"][config.COUNTRY_COL]))
+            block_stats = report_blocking_stats(cands, truth, s1_ids, len(prep["others"]),
+                                                s1_country, verbose=False)
+            valid_ids = ctx["valid_ids"]
+            valid_truth = {s: truth.get(s, []) for s in valid_ids}
+            report = score_report(pred, truth, valid_ids, groups=s1_country)
+            classified = edecomp.classify_true_pairs(prep["s1"], prep["others"], cands,
+                                                     scored, pred, valid_truth, ctx["tau"])
+            fp = edecomp.false_positive_report(scored, pred, valid_truth)
+            o2o = edecomp.one_to_one_removals(scored, valid_truth)
+            stages = classified["stage"].value_counts().to_dict()
+            fit = ctx["fitted"]
+        row = {
+            "variant": name, "overrides": json.dumps(overrides, sort_keys=True),
+            "n_pairs": len(cands), "mean_candidates": block_stats["mean_candidates"],
+            "max_candidates": block_stats["max_candidates"],
+            "pair_recall": block_stats["pair_recall"],
+            "s1_full_recall": block_stats["s1_full_recall"],
+            "recall_India": block_stats.get("recall_India"),
+            "recall_US": block_stats.get("recall_US"),
+            "oof_macro_f05": fit["oof_f05"], "tau": ctx["tau"],
+            "singleton_tau": ctx["singleton_tau"],
+            **{f"valid_{k}": v for k, v in report.items()},
+            "false_positives": len(fp),
+            "blocking_fn": int(stages.get("blocking_false_negative", 0))
+            + int(stages.get("representation_failure", 0)),
+            "matcher_fn": int(stages.get("matcher_false_negative", 0)),
+            "one_to_one_removed": int(o2o["removed_by_one_to_one"].sum()) if len(o2o) else 0,
+            "peak_rss_gib": round(mem.peak, 2), "seconds": round(time.time() - t0, 1),
+        }
+        rows.append(row)
+        _log(f"fix variant '{name}': pairs={len(cands):,} recall={row['pair_recall']:.4f} "
+             f"OOF={row['oof_macro_f05']:.4f} valid={row['valid_macro_f05']:.4f} "
+             f"FP={row['false_positives']} mFN={row['matcher_fn']} peak={mem.peak:.1f}GiB")
+        del ctx, prep, cands, scored, pred, classified, fp, o2o, fit
+    out = pd.DataFrame(rows)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    DIAG_DIR.mkdir(parents=True, exist_ok=True)
+    out.to_csv(DIAG_DIR / f"fix_variants_{ts}.tsv", sep="\t", index=False)
+    diag.save_json({"kind": "fix_variants", "timestamp": ts, "sample": sample,
+                    "variants": {v: FIX_VARIANTS[v] for v in variants},
+                    "use_embeddings": use_embeddings, "git_commit": rp._git_hash(),
+                    "env": diag.env_info()}, DIAG_DIR / f"fix_variants_{ts}.json")
+    print(out.to_string(index=False))
+    return out
+
+
+AUGMENT_VARIANTS = ("baseline", "cf_all_digit_word", "cf_street_word_pair",
+                    "cf_name_addr_tfidf", "cf_all_three")
+
+
+def run_candidate_augment_downstream(sample: float = 0.0045, use_embeddings: bool = True,
+                                     variants: tuple[str, ...] = AUGMENT_VARIANTS) -> pd.DataFrame:
+    """Measurement-only: does adding the counterfactual passes' pairs to the
+    production candidate union improve end-to-end OOF / validation macro F0.5, or do
+    the extra pairs cost more precision than the recall they buy?
+
+    For each variant the candidate frame is the production union plus that pass's
+    pairs not already in it. Added pairs carry ``passes=0`` and NaN ``score_*`` -- a
+    deliberately conservative proxy (a deployed pass would get its own bit and score
+    feature, which could only help the model separate them). Everything downstream is
+    the unmodified path ``run_blocking_k_downstream`` uses: ``build_features``,
+    ``label_pairs``, the GroupKFold OOF fit + τ tuning, ``predict``,
+    ``apply_threshold`` and ``score_report`` on the fixed ``split_s1`` split.
+
+    Writes ``candidate_augment_downstream_<ts>.tsv`` + ``.json`` under
+    ``artifacts/diagnostics/``.
+    """
+    s1, s2, s3, truth = rp._load_train(sample)
+    prep = rp.prepare(s1, s2, s3, use_embeddings=use_embeddings, use_cache=True)
+    del s1, s2, s3
+    base = rp.block(prep)
+    s1_ids = list(prep["s1"][config.ID_COL])
+    s1_country = dict(zip(prep["s1"][config.ID_COL], prep["s1"][config.COUNTRY_COL]))
+    n_other = len(prep["others"])
+    train_ids, valid_ids = rp.split_s1(s1_ids, truth)
+    extra_sets = _counterfactual_pair_sets(prep["s1"], prep["others"])
+    union = set(zip(base["s1_id"], base["cand_id"]))
+    rows = []
+    for name in variants:
+        t0 = time.time()
+        if name == "baseline":
+            cands = base
+        else:
+            add = sorted(extra_sets[name] - union)
+            extra = pd.DataFrame({"s1_id": [a for a, _ in add], "cand_id": [b for _, b in add],
+                                  "passes": np.zeros(len(add), np.uint8)})
+            for c in base.columns:
+                if c.startswith("score_"):
+                    extra[c] = np.float32(np.nan)
+            cands = pd.concat([base, extra[base.columns]], ignore_index=True)
+        block_stats = report_blocking_stats(cands, truth, s1_ids, n_other, s1_country, verbose=False)
+        feats = build_features(cands, prep["s1"], prep["others"], prep["emb"], verbose=False)
+        feats["label"] = label_pairs(feats, truth)
+        in_train = feats["s1_id"].isin(set(train_ids)).to_numpy()
+        fit = _fit_and_tune_with_oof(feats[in_train], truth, train_ids)
+        valid_feats = feats[~in_train]
+        valid_scored = valid_feats[["s1_id", "cand_id"]].assign(
+            prob=predict(fit["model"], valid_feats[feature_columns(feats)]))
+        pred = apply_threshold(valid_scored, fit["tau"], valid_ids, fit["singleton_tau"])
+        report = score_report(pred, truth, valid_ids, groups=s1_country)
+        rows.append({"variant": name, "n_pairs": len(cands),
+                     **{f"block_{k}": v for k, v in block_stats.items()},
+                     "oof_macro_f05": fit["oof_f05"], "tau": fit["tau"],
+                     "singleton_tau": fit["singleton_tau"],
+                     **{f"valid_{k}": v for k, v in report.items()},
+                     "seconds": round(time.time() - t0, 1), "rss_gib": round(_rss_gib()[0], 2)})
+        _log(f"augment '{name}': pairs={len(cands):,} OOF={fit['oof_f05']:.4f} "
+             f"valid={report['macro_f05']:.4f}")
+        del feats, valid_feats, cands
+    out = pd.DataFrame(rows)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    DIAG_DIR.mkdir(parents=True, exist_ok=True)
+    out.to_csv(DIAG_DIR / f"candidate_augment_downstream_{ts}.tsv", sep="\t", index=False)
+    diag.save_json({"kind": "candidate_augment_downstream", "timestamp": ts, "sample": sample,
+                    "variants": list(variants), "use_embeddings": use_embeddings,
+                    "git_commit": rp._git_hash(), "env": diag.env_info()},
+                   DIAG_DIR / f"candidate_augment_downstream_{ts}.json")
+    print(out.to_string(index=False))
+    return out
+
+
+def run_density_stress(sample: float = 0.0045, fractions: tuple[float, ...] = DENSITY_FRACTIONS,
+                       use_embeddings: bool = True, max_rss_gib: float = 12.0,
+                       counterfactuals: bool = False) -> dict:
+    """D4 (measurement-only): how blocking recall and candidate volume change as the
+    retrieval index approaches full-scale density.
+
+    ``subsample_train`` keeps the sampled S1s' true matches but only ``sample`` of the
+    orphans, and drops the true matches of every *non*-sampled S1 -- so at 0.0045 the
+    index holds ~0.5% of the distractors each query competes with at full scale. That
+    makes top-K truncation and ``max_block`` filtering much weaker than in production.
+
+    This keeps the identical sampled S1 frame and its normalised index (``fraction=0``
+    reproduces the production sample union exactly) and adds a nested, hash-selected
+    ``fraction`` of *all* other full-scale S2/S3 records (from the full normalisation
+    caches; orphans and other S1s' matches alike). For each fraction it runs the
+    unmodified ``blocking.generate_candidates`` and reports union recall, per-pass
+    standalone recall (from the ``passes`` bitmask), per-country recall, candidates
+    per S1, runtime and RSS. Embeddings for the added records are encoded with the
+    production encoder and never cached to disk.
+
+    Stops early (recording why) if current RSS exceeds ``max_rss_gib``.
+    Writes ``summary.tsv`` + ``meta.json`` under
+    ``artifacts/diagnostics/density_stress_<ts>/``.
+    """
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    out_dir = DIAG_DIR / f"density_stress_{ts}"
+    s1, s2, s3, truth = rp._load_train(sample)
+    prep = rp.prepare(s1, s2, s3, use_embeddings)
+    del s1, s2, s3
+    base_cands = rp.block(prep)
+    s1f, base = prep["s1"], prep["others"]
+    tp = _true_pair_frame(prep, truth)
+    base_ids = set(base[config.ID_COL])
+    n_full_others = None
+    encoder = load_encoder() if use_embeddings else None
+    base_emb = (np.asarray(prep["emb"][1]) if use_embeddings else None)
+    rows = []
+    for frac in fractions:
+        t0 = time.time()
+        extra = _distractors(frac, base_ids, list(base.columns)) if frac > 0 else base.iloc[:0]
+        others = pd.concat([base, extra[base.columns]], ignore_index=True)
+        emb = None
+        if use_embeddings:
+            extra_emb = (encoder(embedding_text(extra)) if len(extra)
+                         else np.empty((0, base_emb.shape[1]), np.float32))
+            emb = (np.asarray(prep["emb"][0]), np.concatenate([base_emb, extra_emb]))
+            del extra_emb
+        t_block = time.time()
+        cands = (base_cands if frac == 0 else
+                 generate_candidates(s1f, others, embeddings=emb, verbose=False))
+        block_s = time.time() - t_block
+        key = set(zip(cands["s1_id"], cands["cand_id"]))
+        pmap = dict(zip(zip(cands["s1_id"], cands["cand_id"]), cands["passes"].to_numpy()))
+        hit = np.array([(s, c) in key for s, c in zip(tp["s1_id"], tp["cand_id"])])
+        bits = np.array([pmap.get((s, c), 0) for s, c in zip(tp["s1_id"], tp["cand_id"])])
+        per_s1 = cands.groupby("s1_id").size()
+        cf_cols = {}
+        if counterfactuals:
+            cf_cols = _density_counterfactuals(s1f, others, tp, key)
+        cur, peak = _rss_gib()
+        row = {
+            "fraction": frac, "index_records": len(others), "added_distractors": len(extra),
+            "union_pairs": len(cands), "cands_per_s1_mean": round(len(cands) / len(s1f), 2),
+            "cands_per_s1_max": int(per_s1.max()) if len(per_s1) else 0,
+            "union_recall_pct": 100.0 * hit.mean(),
+            "missed_pairs": int((~hit).sum()),
+            **{f"{p}_recall_pct": 100.0 * float(((bits & PASS_BITS[p]) > 0).mean())
+               for p in _PASS_NAMES},
+            **{f"{c}_union_recall_pct": 100.0 * float(hit[(tp["country"] == c).to_numpy()].mean())
+               for c in sorted(tp["country"].unique())},
+            **cf_cols,
+            "block_seconds": round(block_s, 1), "total_seconds": round(time.time() - t0, 1),
+            "rss_gib": round(cur, 2), "peak_rss_gib": round(peak, 2),
+        }
+        rows.append(row)
+        _log(f"density f={frac}: index={len(others):,} pairs={len(cands):,} "
+             f"recall={row['union_recall_pct']:.2f}% rss={cur:.1f}GiB block={block_s:.0f}s")
+        del cands, key, pmap, others, emb, extra
+        if cur > max_rss_gib:
+            _log(f"density stress: stopping, RSS {cur:.1f} GiB > {max_rss_gib} GiB")
+            rows[-1]["stopped_for_memory"] = True
+            break
+    summary = pd.DataFrame(rows)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    summary.to_csv(out_dir / "summary.tsv", sep="\t", index=False)
+    diag.save_json({
+        "kind": "density_stress", "timestamp": ts, "sample": sample,
+        "fractions": list(fractions), "use_embeddings": use_embeddings,
+        "n_s1": len(s1f), "n_true_pairs": len(tp), "full_others_records": n_full_others,
+        "git_commit": rp._git_hash(), "env": diag.env_info(),
+    }, out_dir / "meta.json")
+    _log(f"density stress written under {out_dir}")
+    print(summary.to_string(index=False))
+    return {"summary": summary, "out_dir": str(out_dir)}
+
+
+def _distractor_embeddings(extra: pd.DataFrame, frac: float, encoder) -> np.ndarray:
+    """Embeddings of a density run's distractors, cached under ``artifacts/`` keyed on
+    the fraction, the distractor IDs and the pinned model (never used by production)."""
+    import hashlib
+    h = hashlib.sha1(f"{frac}|{config.EMBEDDING_MODEL}|{config.EMBEDDING_REVISION}".encode())
+    h.update(pd.util.hash_pandas_object(extra[config.ID_COL], index=False).values.tobytes())
+    path = config.ARTIFACTS_DIR / f"density_emb_{h.hexdigest()[:16]}.npy"
+    if path.exists():
+        return np.load(path, mmap_mode="r")
+    vecs = np.asarray(encoder(embedding_text(extra)), dtype=np.float32)
+    config.ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    np.save(path, vecs)
+    return vecs
+
+
+def run_density_variants(sample: float = 0.0045, fractions: tuple[float, ...] = (0.0, 0.02, 0.1),
+                         variants: tuple[str, ...] = ("baseline", "combined_k10", "combined_k20"),
+                         use_embeddings: bool = True) -> pd.DataFrame:
+    """Density validation of production fix configurations.
+
+    For each ``fraction`` the index is the sample's normalised others plus the same
+    nested, hash-selected distractors ``density-stress`` uses (built once per
+    fraction); every :data:`FIX_VARIANTS` configuration in ``variants`` is then run
+    through the unmodified production ``blocking.generate_candidates`` under its
+    config overrides. Reports union recall (overall, per country), per-pass recall
+    for every active pass, candidates per S1 (mean/max), pairs, blocking-stage
+    peak RSS (:class:`_PeakSampler`) and runtime. Writes
+    ``density_variants_<ts>.tsv`` + ``.json`` under ``artifacts/diagnostics/``.
+    """
+    s1, s2, s3, truth = rp._load_train(sample)
+    prep = rp.prepare(s1, s2, s3, use_embeddings)
+    del s1, s2, s3
+    s1f, base = prep["s1"].reset_index(drop=True), prep["others"].reset_index(drop=True)
+    tp = _true_pair_frame(prep, truth)
+    tkeys = list(zip(tp["s1_id"], tp["cand_id"]))
+    countries = tp["country"].to_numpy()
+    base_ids = set(base[config.ID_COL])
+    encoder = load_encoder() if use_embeddings else None
+    rows = []
+    for frac in fractions:
+        extra = _distractors(frac, base_ids, list(base.columns)) if frac > 0 else base.iloc[:0]
+        others = pd.concat([base, extra[base.columns]], ignore_index=True)
+        emb = None
+        if use_embeddings:
+            xe = (_distractor_embeddings(extra, frac, encoder) if len(extra)
+                  else np.empty((0, np.asarray(prep["emb"][1]).shape[1]), np.float32))
+            emb = (np.asarray(prep["emb"][0]), np.concatenate([np.asarray(prep["emb"][1]), xe]))
+            del xe
+        for name in variants:
+            with config_overrides(FIX_VARIANTS[name]), _PeakSampler(interval=0.05) as mem:
+                t0 = time.time()
+                cands = generate_candidates(s1f, others, embeddings=emb, verbose=False)
+                secs = time.time() - t0
+                active = active_passes()
+            pmap = dict(zip(zip(cands["s1_id"], cands["cand_id"]), cands["passes"].to_numpy()))
+            bits = np.array([pmap.get(k, 0) for k in tkeys])
+            hit = bits > 0
+            per_s1 = cands.groupby("s1_id").size()
+            row = {"fraction": frac, "variant": name, "index_records": len(others),
+                   "union_pairs": len(cands),
+                   "cands_per_s1_mean": round(len(cands) / len(s1f), 2),
+                   "cands_per_s1_max": int(per_s1.max()) if len(per_s1) else 0,
+                   "union_recall_pct": 100.0 * hit.mean(), "missed_pairs": int((~hit).sum()),
+                   **{f"{c}_recall_pct": 100.0 * float(hit[countries == c].mean())
+                      for c in sorted(set(countries))},
+                   **{f"{p}_recall_pct": 100.0 * float(((bits & PASS_BITS[p]) > 0).mean())
+                      for p in active},
+                   "block_seconds": round(secs, 1),
+                   "block_peak_over_start_gib": round(mem.peak - mem.start, 2),
+                   "peak_rss_gib": round(mem.peak, 2)}
+            rows.append(row)
+            _log(f"density f={frac} {name}: pairs={len(cands):,} "
+                 f"recall={row['union_recall_pct']:.2f}% ({row['cands_per_s1_mean']}/S1) "
+                 f"block={secs:.0f}s peak={mem.peak:.1f}GiB")
+            del cands, pmap
+        del others, emb, extra
+    out = pd.DataFrame(rows)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    DIAG_DIR.mkdir(parents=True, exist_ok=True)
+    out.to_csv(DIAG_DIR / f"density_variants_{ts}.tsv", sep="\t", index=False)
+    diag.save_json({"kind": "density_variants", "timestamp": ts, "sample": sample,
+                    "fractions": list(fractions),
+                    "variants": {v: FIX_VARIANTS[v] for v in variants},
+                    "git_commit": rp._git_hash(), "env": diag.env_info()},
+                   DIAG_DIR / f"density_variants_{ts}.json")
+    print(out.to_string(index=False))
+    return out
+
+
+def _old_compute_embeddings(frame: pd.DataFrame, encoder) -> np.ndarray:
+    """The pre-fix ``compute_embeddings`` body (no cache), kept only so
+    ``memory-budget`` can measure the old peak against the new chunked path."""
+    uniq, inverse = np.unique(np.asarray(embedding_text(frame), dtype=object), return_inverse=True)
+    return encoder(list(uniq)).astype(np.float32)[inverse]
+
+
+def run_memory_budget(sample: float = 0.0045, variant: str = "combined_k20",
+                      pair_counts: tuple[int, ...] = (400_000, 1_000_000, 2_000_000),
+                      chunks: tuple[int, ...] = (1_000_000, 250_000),
+                      model_pairs: tuple[int, ...] = (400_000, 1_000_000),
+                      embed_fraction: float = 0.02) -> pd.DataFrame:
+    """Memory budget of the production pipeline under a :data:`FIX_VARIANTS` config.
+
+    Stages (each wrapped in :class:`_PeakSampler`; ``peak_over_start`` is the
+    transient+resident growth the stage adds on top of what already exists):
+
+    * ``features``: production ``build_features`` (incl. blocking + context
+      features) on the variant's real sample candidates tiled to each pair count,
+      for each ``FEATURE_CHUNK`` in ``chunks``; ``end_delta`` is the resident frame.
+    * ``model``: production ``run_pipeline.fit_and_tune`` (GroupKFold OOF + τ + full
+      fit) on tiled labelled features.
+    * ``embed_old`` / ``embed_new``: the pre-fix encoding path vs production
+      ``compute_embeddings`` (chunked, memmap cache in a temp dir) on the same real
+      distractor records (``embed_fraction`` of full-scale S2/S3).
+
+    Writes ``memory_budget_<ts>.tsv`` (+ per-stage bytes/pair fit rows) and ``.json``.
+    """
+    import tempfile
+    s1, s2, s3, truth = rp._load_train(sample)
+    rows = []
+    with config_overrides(FIX_VARIANTS[variant]):
+        prep = rp.prepare(s1, s2, s3, use_embeddings=True)
+        del s1, s2, s3
+        base = rp.block(prep)
+        emb = (np.ascontiguousarray(prep["emb"][0]), np.ascontiguousarray(prep["emb"][1]))
+        ctx = FeatureContext.fit(prep["s1"], prep["others"])
+        for chunk in chunks:
+            for n in pair_counts:
+                cands = _tile_candidates(base, n)
+                with config_overrides({"FEATURE_CHUNK": chunk}), _PeakSampler() as m:
+                    feats = build_features(cands, prep["s1"], prep["others"], emb, ctx=ctx,
+                                           verbose=False)
+                rows.append({"stage": "features", "chunk": chunk, "pairs": n,
+                             "n_cols": feats.shape[1], "start_gib": m.start,
+                             "peak_over_start_gib": m.peak - m.start,
+                             "end_delta_gib": m.end - m.start})
+                _log(f"budget features chunk={chunk:,} n={n:,}: +{m.peak - m.start:.2f} GiB "
+                     f"peak, +{m.end - m.start:.2f} GiB resident")
+                del feats, cands
+        feats_base = build_features(base, prep["s1"], prep["others"], emb, ctx=ctx, verbose=False)
+        feats_base["label"] = label_pairs(feats_base, truth)
+        s1_ids = list(prep["s1"][config.ID_COL])
+        for n in model_pairs:
+            ft = _tile_candidates(feats_base, n)
+            with _PeakSampler() as m:
+                rp.fit_and_tune(ft, truth, s1_ids, verbose=False)
+            rows.append({"stage": "model", "pairs": n, "n_cols": ft.shape[1],
+                         "start_gib": m.start, "peak_over_start_gib": m.peak - m.start,
+                         "end_delta_gib": m.end - m.start})
+            _log(f"budget model n={n:,}: +{m.peak - m.start:.2f} GiB peak")
+            del ft
+        del feats_base
+    extra = _distractors(embed_fraction, set(), list(prep["others"].columns))
+    encoder = load_encoder()
+    with _PeakSampler() as m:
+        v = _old_compute_embeddings(extra, encoder)
+    rows.append({"stage": "embed_old", "pairs": len(extra), "start_gib": m.start,
+                 "peak_over_start_gib": m.peak - m.start, "end_delta_gib": m.end - m.start,
+                 "matrix_gib": v.nbytes / 2 ** 30})
+    del v
+    with tempfile.TemporaryDirectory() as tmp, \
+            config_overrides({"ARTIFACTS_DIR": Path(tmp)}), _PeakSampler() as m:
+        v = compute_embeddings(extra, encoder, cache=True)
+        nbytes = v.nbytes
+        del v
+    rows.append({"stage": "embed_new", "pairs": len(extra), "start_gib": m.start,
+                 "peak_over_start_gib": m.peak - m.start, "end_delta_gib": m.end - m.start,
+                 "matrix_gib": nbytes / 2 ** 30})
+    _log(f"budget embeddings on {len(extra):,} records: old +{rows[-2]['peak_over_start_gib']:.2f}"
+         f" GiB peak, new +{rows[-1]['peak_over_start_gib']:.2f} GiB peak")
+    out = pd.DataFrame(rows)
+    fits = []
+    for (stage, chunk), g in out[out["stage"].isin(["features", "model"])].groupby(
+            ["stage", out["chunk"].fillna(0)]):
+        for col in ("peak_over_start_gib", "end_delta_gib"):
+            if g["pairs"].nunique() >= 2:
+                b, a = np.polyfit(g["pairs"].to_numpy(float), g[col].to_numpy(float), 1)
+                fits.append({"stage": f"fit:{stage}", "chunk": chunk, "metric": col,
+                             "intercept_gib": a, "bytes_per_pair": b * 2 ** 30})
+    for name in ("embed_old", "embed_new"):
+        r = out[out["stage"] == name].iloc[0]
+        fits.append({"stage": f"fit:{name}", "metric": "peak_over_start_gib",
+                     "bytes_per_pair": r["peak_over_start_gib"] * 2 ** 30 / r["pairs"],
+                     "intercept_gib": 0.0})
+    out = pd.concat([out, pd.DataFrame(fits)], ignore_index=True)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    DIAG_DIR.mkdir(parents=True, exist_ok=True)
+    out.to_csv(DIAG_DIR / f"memory_budget_{ts}.tsv", sep="\t", index=False)
+    diag.save_json({"kind": "memory_budget", "timestamp": ts, "sample": sample,
+                    "variant": variant, "overrides": FIX_VARIANTS[variant],
+                    "git_commit": rp._git_hash(), "env": diag.env_info()},
+                   DIAG_DIR / f"memory_budget_{ts}.json")
+    print(out.to_string(index=False))
+    return out
+
+
+# --- D3: retrieval rank of true pairs ------------------------------------------------------
+
+RANK_METHODS = ("tfidf_char_name_prod", "tfidf_char_name_unpruned", "tfidf_word_name",
+                "tfidf_char_name_addr", "embed")
+
+
+def _true_ranks_sparse(q: "sparse.csr_matrix", x: "sparse.csr_matrix", q_pos: np.ndarray,
+                       x_pos: np.ndarray, budget: int = 20_000_000) -> np.ndarray:
+    """1-based rank of index row ``x_pos[i]`` among all index rows for query
+    ``q_pos[i]`` by dot product (ties counted in the true pair's favour). A zero score
+    gives rank ``inf`` (unreachable by top-k on stored entries)."""
+    from scipy import sparse as sp
+    xt = x.T.tocsr()
+    ranks = np.full(len(q_pos), np.inf)
+    uq = np.unique(q_pos)
+    step = max(1, budget // max(x.shape[0], 1))
+    for s in range(0, len(uq), step):
+        qs = uq[s:s + step]
+        dense = np.asarray((q[qs] @ xt).todense()) if sp.issparse(q) else q[qs] @ xt
+        row_of = {v: i for i, v in enumerate(qs)}
+        sel = np.where(np.isin(q_pos, qs))[0]
+        for i in sel:
+            row = dense[row_of[q_pos[i]]]
+            t = row[x_pos[i]]
+            ranks[i] = np.inf if t <= 0 else 1 + int((row > t).sum())
+    return ranks
+
+
+def _true_ranks_dense(qe: np.ndarray, xe: np.ndarray, q_pos: np.ndarray, x_pos: np.ndarray,
+                      budget: int = 20_000_000) -> np.ndarray:
+    """Dense (cosine) analogue of :func:`_true_ranks_sparse`."""
+    ranks = np.full(len(q_pos), np.inf)
+    uq = np.unique(q_pos)
+    step = max(1, budget // max(len(xe), 1))
+    for s in range(0, len(uq), step):
+        qs = uq[s:s + step]
+        sims = np.asarray(qe[qs], np.float32) @ np.asarray(xe, np.float32).T
+        row_of = {v: i for i, v in enumerate(qs)}
+        for i in np.where(np.isin(q_pos, qs))[0]:
+            row = sims[row_of[q_pos[i]]]
+            ranks[i] = 1 + int((row > row[x_pos[i]]).sum())
+    return ranks
+
+
+def run_name_retrieval_rank(sample: float = 0.0045, use_embeddings: bool = True) -> dict:
+    """D3 (measurement-only): exact rank of every true candidate under the production
+    retrieval representations and simple alternatives, at sample density.
+
+    Per ``blocking.country_groups`` group, fits vectorizers exactly as
+    ``blocking.tfidf_name_pass`` does (same analyzer, n-grams, min/max df switch) and
+    ranks each true pair's candidate among the whole group index:
+
+    * ``tfidf_char_name_prod``: production queries pruned to ``TFIDF_QUERY_TERMS``;
+    * ``tfidf_char_name_unpruned``: same vectorizer, full query vector;
+    * ``tfidf_word_name``: word-unigram TF-IDF on ``name_core``;
+    * ``tfidf_char_name_addr``: char TF-IDF on ``name_core + addr_norm``;
+    * ``embed``: production embeddings (cosine).
+
+    Rank ``inf`` = zero score (not retrievable at any k by a sparse top-k). Reports,
+    for all true pairs and for those the production union missed, the share within
+    k = 20 / 40 / 100 / 1000 and unreachable, per method and country. Writes
+    ``summary.tsv``, ``ranks.tsv`` and ``meta.json`` under
+    ``artifacts/diagnostics/name_retrieval_rank_<ts>/``.
+    """
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    out_dir = DIAG_DIR / f"name_retrieval_rank_{ts}"
+    s1, s2, s3, truth = rp._load_train(sample)
+    prep = rp.prepare(s1, s2, s3, use_embeddings)
+    del s1, s2, s3
+    cands = rp.block(prep)
+    s1f, xf = prep["s1"].reset_index(drop=True), prep["others"].reset_index(drop=True)
+    tp = _true_pair_frame(prep, truth)
+    union = set(zip(cands["s1_id"], cands["cand_id"]))
+    tp["in_union"] = [(s, c) in union for s, c in zip(tp["s1_id"], tp["cand_id"])]
+    s1_pos = pd.Index(s1f[config.ID_COL]).get_indexer(tp["s1_id"])
+    x_pos = pd.Index(xf[config.ID_COL]).get_indexer(tp["cand_id"])
+    methods = [m for m in RANK_METHODS if m != "embed" or use_embeddings]
+    for m in methods:
+        tp[m] = np.inf
+    for country, q_idx, x_idx in country_groups(s1f, xf, config.BLOCK_WITHIN_COUNTRY):
+        sel = np.where(tp["country"].to_numpy() == country)[0]
+        if len(sel) == 0 or len(x_idx) == 0:
+            continue
+        # map global positions -> group positions
+        qmap = pd.Series(np.arange(len(q_idx)), index=q_idx)
+        xmap = pd.Series(np.arange(len(x_idx)), index=x_idx)
+        ok = np.isin(x_pos[sel], x_idx)
+        sel = sel[ok]
+        gq = qmap.loc[s1_pos[sel]].to_numpy()
+        gx = xmap.loc[x_pos[sel]].to_numpy()
+        q, x = s1f.iloc[q_idx], xf.iloc[x_idx]
+        big = len(q_idx) + len(x_idx) >= config.TFIDF_MAX_DF_MIN_DOCS
+        kw = dict(min_df=config.TFIDF_MIN_DF if big else 1,
+                  max_df=config.TFIDF_MAX_DF if big else 1.0, dtype=np.float32, sublinear_tf=True)
+        texts = {
+            "char": (q["name_core"], x["name_core"]),
+            "addr": (q["name_core"] + " " + q["addr_norm"], x["name_core"] + " " + x["addr_norm"]),
+        }
+        specs = {
+            "tfidf_char_name_prod": ("char", dict(analyzer="char_wb", ngram_range=config.TFIDF_NGRAM), True),
+            "tfidf_char_name_unpruned": ("char", dict(analyzer="char_wb", ngram_range=config.TFIDF_NGRAM), False),
+            "tfidf_word_name": ("char", dict(analyzer="word", token_pattern=r"\S+"), False),
+            "tfidf_char_name_addr": ("addr", dict(analyzer="char_wb", ngram_range=config.TFIDF_NGRAM), False),
+        }
+        for m, (src, akw, prune) in specs.items():
+            qt, xt = texts[src]
+            vec = TfidfVectorizer(**akw, **kw).fit(pd.concat([qt, xt], ignore_index=True))
+            qm = vec.transform(qt)
+            if prune:
+                qm = prune_rows(qm, config.TFIDF_QUERY_TERMS)
+            tp.loc[tp.index[sel], m] = _true_ranks_sparse(qm, vec.transform(xt), gq, gx)
+            _log(f"rank {country} {m} done")
+        if use_embeddings:
+            qe, xe = np.asarray(prep["emb"][0])[q_idx], np.asarray(prep["emb"][1])[x_idx]
+            tp.loc[tp.index[sel], "embed"] = _true_ranks_dense(qe, xe, gq, gx)
+    rows = []
+    for scope, frame in (("all_true", tp), ("missed_by_union", tp[~tp["in_union"]])):
+        for country, g in [("ALL", frame), *frame.groupby("country")]:
+            for m in methods:
+                r = g[m].to_numpy()
+                rows.append({"scope": scope, "country": country, "method": m, "n": len(r),
+                             **{f"within_{k}_pct": 100.0 * float((r <= k).mean()) if len(r) else 0.0
+                                for k in (20, 40, 100, 1000)},
+                             "unreachable_pct": 100.0 * float(np.isinf(r).mean()) if len(r) else 0.0})
+    summary = pd.DataFrame(rows)
+    # Replication check: every true pair production's TF-IDF pass returned must rank
+    # within K_TFIDF_NAME under the replicated production ranking (ties aside).
+    pmap = dict(zip(zip(cands["s1_id"], cands["cand_id"]), cands["passes"].to_numpy()))
+    tf_bit = np.array([(pmap.get((s, c), 0) & PASS_BITS["tfidf"]) > 0
+                       for s, c in zip(tp["s1_id"], tp["cand_id"])])
+    sanity = (100.0 * float((tp.loc[tf_bit, "tfidf_char_name_prod"] <= config.K_TFIDF_NAME).mean())
+              if tf_bit.any() else None)
+    _log(f"replication check: {sanity}% of TF-IDF-retrieved true pairs rank <= "
+         f"{config.K_TFIDF_NAME} under the replicated ranking")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    summary.to_csv(out_dir / "summary.tsv", sep="\t", index=False)
+    tp.to_csv(out_dir / "ranks.tsv", sep="\t", index=False)
+    diag.save_json({"kind": "name_retrieval_rank", "timestamp": ts, "sample": sample,
+                    "sanity_tfidf_bit_within_k_pct": sanity,
+                    "n_true_pairs": len(tp), "n_missed": int((~tp["in_union"]).sum()),
+                    "git_commit": rp._git_hash(), "env": diag.env_info()},
+                   out_dir / "meta.json")
+    _log(f"retrieval rank written under {out_dir}")
+    print(summary.to_string(index=False))
+    return {"summary": summary, "ranks": tp, "out_dir": str(out_dir)}
+
+
+# --- D8: feature-stage memory profile ------------------------------------------------------
+
+class _PeakSampler:
+    """Context manager polling this process's RSS on a background thread, so a
+    transient peak *inside* a call is captured (Windows only exposes a lifetime
+    peak). ``start``/``end``/``peak`` are in GiB after exit."""
+
+    def __init__(self, interval: float = 0.02):
+        """Store the polling interval (seconds)."""
+        self.interval = interval
+        self.start = self.end = self.peak = float("nan")
+
+    def __enter__(self):
+        """Record the starting RSS and begin polling."""
+        import threading
+        import psutil
+        self._proc = psutil.Process()
+        self._stop = threading.Event()
+        self.start = self.peak = self._proc.memory_info().rss / 2 ** 30
+
+        def poll():
+            """Track the maximum RSS until stopped."""
+            while not self._stop.is_set():
+                self.peak = max(self.peak, self._proc.memory_info().rss / 2 ** 30)
+                time.sleep(self.interval)
+
+        self._thread = threading.Thread(target=poll, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        """Stop polling and record the final RSS."""
+        self._stop.set()
+        self._thread.join()
+        self.end = self._proc.memory_info().rss / 2 ** 30
+        self.peak = max(self.peak, self.end)
+        return False
+
+
+MEMORY_PROFILE_PAIRS = (400_000, 1_000_000, 2_000_000)
+
+
+def _tile_candidates(cands: pd.DataFrame, n: int) -> pd.DataFrame:
+    """First ``n`` rows of ``cands`` repeated as often as needed (real pairs, so every
+    feature is computed on real record content; duplicates only inflate counts)."""
+    reps = int(np.ceil(n / len(cands)))
+    idx = np.tile(np.arange(len(cands)), reps)[:n]
+    return cands.iloc[idx].reset_index(drop=True)
+
+
+def run_memory_profile(sample: float = 0.0045, pair_counts: tuple[int, ...] = MEMORY_PROFILE_PAIRS,
+                       chunks: tuple[int, ...] = (250_000, config.FEATURE_CHUNK),
+                       use_embeddings: bool = True, full_scale_pairs: int = 22_100_000) -> dict:
+    """D8 (measurement-only): where does feature-stage memory go, and how does it
+    scale with candidate pairs?
+
+    Replays ``features.build_features`` step by step with the *same* production
+    functions (``FeatureContext.fit``, ``pair_features`` per chunk into preallocated
+    float32 buffers, ``blocking_features``, ``pd.DataFrame`` assembly,
+    ``context_features``), wrapping each step in :class:`_PeakSampler`. Candidates
+    are the real production sample union tiled to each ``pair_counts`` value.
+    Also sweeps ``chunks`` at the largest pair count to isolate the per-chunk
+    transient (row gathers incl. the two embedding gathers) from the per-pair
+    residency (buffers, ID columns, context features).
+
+    Per stage it fits ``GiB = a + b * pairs`` over ``pair_counts`` and extrapolates to
+    ``full_scale_pairs``. Also records ``memory_usage(deep=True)`` of the assembled
+    frame split into object ID columns vs float columns, and the analytic size of
+    the full-scale S2+S3 embedding matrix. Writes ``stages.tsv``, ``fit.tsv`` and
+    ``meta.json`` under ``artifacts/diagnostics/memory_profile_<ts>/``.
+    """
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    out_dir = DIAG_DIR / f"memory_profile_{ts}"
+    s1, s2, s3, truth = rp._load_train(sample)
+    prep = rp.prepare(s1, s2, s3, use_embeddings)
+    del s1, s2, s3
+    base = rp.block(prep)
+    s1f = prep["s1"].reset_index(drop=True)
+    xf = prep["others"].reset_index(drop=True)
+    emb = prep["emb"]
+    if emb is not None:  # materialise once so mmap page-in is not charged to a stage
+        emb = (np.ascontiguousarray(emb[0]), np.ascontiguousarray(emb[1]))
+    with _PeakSampler() as m_ctx:
+        ctx = FeatureContext.fit(s1f, xf)
+    rows = [{"stage": "feature_context_fit", "pairs": 0, "chunk": 0,
+             "start_gib": m_ctx.start, "end_gib": m_ctx.end, "peak_gib": m_ctx.peak}]
+    s1_index, x_index = pd.Index(s1f[config.ID_COL]), pd.Index(xf[config.ID_COL])
+    runs = [(n, config.FEATURE_CHUNK) for n in pair_counts]
+    runs += [(max(pair_counts), c) for c in chunks if c != config.FEATURE_CHUNK]
+    frame_usage = {}
+    for n, chunk in runs:
+        cands = _tile_candidates(base, n)
+        i1 = s1_index.get_indexer(cands["s1_id"])
+        i2 = x_index.get_indexer(cands["cand_id"])
+        buffers: dict[str, np.ndarray] | None = None
+        chunk_peak = 0.0
+        with _PeakSampler() as m_loop:
+            for start in range(0, n, chunk):
+                end = min(start + chunk, n)
+                a, b = i1[start:end], i2[start:end]
+                with _PeakSampler() as m_chunk:
+                    r1 = s1f.iloc[a].reset_index(drop=True)
+                    r2 = xf.iloc[b].reset_index(drop=True)
+                    e = (emb[0][a], emb[1][b]) if emb is not None else None
+                    part = pair_features(r1, r2, ctx, e)
+                    del r1, r2, e
+                chunk_peak = max(chunk_peak, m_chunk.peak - m_chunk.start)
+                if buffers is None:
+                    buffers = {col: np.empty(n, dtype=np.float32) for col in part.columns}
+                for col in part.columns:
+                    buffers[col][start:end] = part[col].to_numpy()
+                del part
+        rows.append({"stage": "pair_feature_loop", "pairs": n, "chunk": chunk,
+                     "start_gib": m_loop.start, "end_gib": m_loop.end, "peak_gib": m_loop.peak,
+                     "max_chunk_transient_gib": chunk_peak,
+                     "buffer_gib": sum(v.nbytes for v in buffers.values()) / 2 ** 30,
+                     "n_buffer_cols": len(buffers)})
+        if chunk != config.FEATURE_CHUNK:
+            del buffers, cands
+            continue
+        with _PeakSampler() as m_asm:
+            bf = blocking_features(cands)
+            data = {KEY_COLS[0]: cands["s1_id"].to_numpy(), KEY_COLS[1]: cands["cand_id"].to_numpy()}
+            data.update(buffers)
+            data.update({col: bf[col].to_numpy() for col in bf.columns})
+            out = pd.DataFrame(data)
+            del bf, data
+        rows.append({"stage": "frame_assembly", "pairs": n, "chunk": chunk,
+                     "start_gib": m_asm.start, "end_gib": m_asm.end, "peak_gib": m_asm.peak})
+        del buffers
+        with _PeakSampler() as m_cf:
+            out = context_features(out)
+        rows.append({"stage": "context_features", "pairs": n, "chunk": chunk,
+                     "start_gib": m_cf.start, "end_gib": m_cf.end, "peak_gib": m_cf.peak})
+        usage = out.memory_usage(deep=True, index=False)
+        id_cols = list(KEY_COLS)
+        frame_usage[n] = {
+            "id_object_gib": float(usage[id_cols].sum()) / 2 ** 30,
+            "id_category_gib": float(sum(out[c].astype("category").memory_usage(deep=True)
+                                         for c in id_cols)) / 2 ** 30,
+            "numeric_gib": float(usage.drop(id_cols).sum()) / 2 ** 30,
+            "n_cols": out.shape[1],
+        }
+        rows.append({"stage": "final_frame_resident", "pairs": n, "chunk": chunk,
+                     **frame_usage[n]})
+        _log(f"memory profile n={n:,}: frame ids={frame_usage[n]['id_object_gib']:.2f}GiB "
+             f"numeric={frame_usage[n]['numeric_gib']:.2f}GiB rss={_rss_gib()[0]:.1f}GiB")
+        del out, cands
+
+    stages = pd.DataFrame(rows)
+    stages["delta_gib"] = stages["end_gib"] - stages["start_gib"]
+    stages["peak_over_start_gib"] = stages["peak_gib"] - stages["start_gib"]
+    fits = []
+    main = stages[stages["chunk"].isin([config.FEATURE_CHUNK])]
+    for stage, g in main.groupby("stage"):
+        for col in ("delta_gib", "peak_over_start_gib", "id_object_gib", "numeric_gib",
+                    "buffer_gib"):
+            if col not in g or g[col].isna().all() or g["pairs"].nunique() < 2:
+                continue
+            b, a = np.polyfit(g["pairs"].to_numpy(float), g[col].to_numpy(float), 1)
+            fits.append({"stage": stage, "metric": col, "intercept_gib": a,
+                         "bytes_per_pair": b * 2 ** 30,
+                         "extrapolated_gib_at_full": a + b * full_scale_pairs})
+    fit = pd.DataFrame(fits)
+    n_full_others = 5_034_616 + 5_285_603
+    dim = int(emb[1].shape[1]) if emb is not None else 384
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stages.to_csv(out_dir / "stages.tsv", sep="\t", index=False)
+    fit.to_csv(out_dir / "fit.tsv", sep="\t", index=False)
+    diag.save_json({
+        "kind": "memory_profile", "timestamp": ts, "sample": sample,
+        "pair_counts": list(pair_counts), "chunks": list(chunks),
+        "full_scale_pairs": full_scale_pairs, "feature_chunk": config.FEATURE_CHUNK,
+        "full_train_others_embedding_gib": n_full_others * dim * 4 / 2 ** 30,
+        "per_chunk_embedding_gather_gib": 2 * config.FEATURE_CHUNK * dim * 4 / 2 ** 30,
+        "frame_usage": {str(k): v for k, v in frame_usage.items()},
+        "git_commit": rp._git_hash(), "env": diag.env_info(),
+    }, out_dir / "meta.json")
+    _log(f"memory profile written under {out_dir}")
+    print(stages.to_string(index=False))
+    print(fit.to_string(index=False))
+    return {"stages": stages, "fit": fit, "out_dir": str(out_dir)}
 
 
 # --- CLI ---------------------------------------------------------------------------------
@@ -2915,6 +4399,84 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                      help="S1 sample fraction (default: 0.0045, the reproducible baseline scale)")
     bff.add_argument("--no-embeddings", action="store_true")
 
+    baf = sub.add_parser(
+        "blocking-address-forensics",
+        help="Key-level forensics on blocking.address_pass for the strong-address "
+             "clean blocking false negatives (no shared key vs. filtered by "
+             "ADDRESS_MAX_BLOCK vs. loses the K_ADDRESS top-k cut)")
+    baf.add_argument("--sample", type=float, default=0.0045,
+                     help="S1 sample fraction (default: 0.0045, the reproducible baseline scale)")
+    baf.add_argument("--no-embeddings", action="store_true")
+
+    kcf = sub.add_parser(
+        "blocking-key-counterfactual",
+        help="D2: recall/candidate cost of alternative blocking-key schemes vs the "
+             "production union (measurement only)")
+    kcf.add_argument("--sample", type=float, default=0.0045,
+                     help="S1 sample fraction (default: 0.0045, the reproducible baseline scale)")
+    kcf.add_argument("--no-embeddings", action="store_true")
+
+    ds_ = sub.add_parser(
+        "density-stress",
+        help="D4: blocking recall / candidate volume as index density approaches full scale")
+    ds_.add_argument("--sample", type=float, default=0.0045,
+                     help="S1 sample fraction (default: 0.0045, the reproducible baseline scale)")
+    ds_.add_argument("--fractions", type=float, nargs="+", default=list(DENSITY_FRACTIONS),
+                     help="fractions of all other full-scale S2/S3 records added as distractors")
+    ds_.add_argument("--max-rss-gib", type=float, default=12.0)
+    ds_.add_argument("--counterfactuals", action="store_true",
+                     help="also measure name+address TF-IDF and D2's best key schemes")
+    ds_.add_argument("--no-embeddings", action="store_true")
+
+    mb = sub.add_parser(
+        "memory-budget",
+        help="measured per-pair memory of features/model/embeddings for a fix configuration")
+    mb.add_argument("--sample", type=float, default=0.0045,
+                    help="S1 sample fraction (default: 0.0045, the reproducible baseline scale)")
+    mb.add_argument("--variant", default="combined_k20", choices=list(FIX_VARIANTS))
+
+    dv2 = sub.add_parser(
+        "density-variants",
+        help="blocking recall / volume / RSS of fix configurations as index density grows")
+    dv2.add_argument("--sample", type=float, default=0.0045,
+                     help="S1 sample fraction (default: 0.0045, the reproducible baseline scale)")
+    dv2.add_argument("--fractions", type=float, nargs="+", default=[0.0, 0.02, 0.1])
+    dv2.add_argument("--variants", nargs="+", default=["baseline", "combined_k10", "combined_k20"],
+                     choices=list(FIX_VARIANTS))
+    dv2.add_argument("--no-embeddings", action="store_true")
+
+    fv = sub.add_parser(
+        "fix-variants",
+        help="end-to-end comparison of production retrieval/memory fix configurations")
+    fv.add_argument("--sample", type=float, default=0.0045,
+                    help="S1 sample fraction (default: 0.0045, the reproducible baseline scale)")
+    fv.add_argument("--variants", nargs="+", default=list(FIX_VARIANTS),
+                    choices=list(FIX_VARIANTS))
+    fv.add_argument("--no-embeddings", action="store_true")
+
+    ca = sub.add_parser(
+        "candidate-augment-downstream",
+        help="end-to-end OOF/valid F0.5 with counterfactual passes' pairs added to the union")
+    ca.add_argument("--sample", type=float, default=0.0045,
+                    help="S1 sample fraction (default: 0.0045, the reproducible baseline scale)")
+    ca.add_argument("--no-embeddings", action="store_true")
+
+    nr = sub.add_parser(
+        "name-retrieval-rank",
+        help="D3: exact rank of true candidates under production and alternative retrieval")
+    nr.add_argument("--sample", type=float, default=0.0045,
+                    help="S1 sample fraction (default: 0.0045, the reproducible baseline scale)")
+    nr.add_argument("--no-embeddings", action="store_true")
+
+    mp = sub.add_parser(
+        "memory-profile",
+        help="D8: per-stage feature memory vs candidate pairs, extrapolated to full scale")
+    mp.add_argument("--sample", type=float, default=0.0045,
+                    help="S1 sample fraction (default: 0.0045, the reproducible baseline scale)")
+    mp.add_argument("--pairs", type=int, nargs="+", default=list(MEMORY_PROFILE_PAIRS))
+    mp.add_argument("--full-scale-pairs", type=int, default=22_100_000)
+    mp.add_argument("--no-embeddings", action="store_true")
+
     return parser.parse_args(argv)
 
 
@@ -2949,6 +4511,27 @@ def main(argv: list[str] | None = None) -> None:
         run_blocking_fn_attribution(args.sample, not args.no_embeddings)
     elif args.command == "blocking-fn-forensics":
         run_blocking_fn_forensics(args.sample, not args.no_embeddings)
+    elif args.command == "blocking-address-forensics":
+        run_blocking_address_forensics(args.sample, not args.no_embeddings)
+    elif args.command == "blocking-key-counterfactual":
+        run_blocking_key_counterfactual(args.sample, not args.no_embeddings)
+    elif args.command == "density-stress":
+        run_density_stress(args.sample, tuple(args.fractions), not args.no_embeddings,
+                           args.max_rss_gib, args.counterfactuals)
+    elif args.command == "memory-budget":
+        run_memory_budget(args.sample, args.variant)
+    elif args.command == "density-variants":
+        run_density_variants(args.sample, tuple(args.fractions), tuple(args.variants),
+                             not args.no_embeddings)
+    elif args.command == "fix-variants":
+        run_fix_variants(args.sample, tuple(args.variants), not args.no_embeddings)
+    elif args.command == "candidate-augment-downstream":
+        run_candidate_augment_downstream(args.sample, not args.no_embeddings)
+    elif args.command == "name-retrieval-rank":
+        run_name_retrieval_rank(args.sample, not args.no_embeddings)
+    elif args.command == "memory-profile":
+        run_memory_profile(args.sample, tuple(args.pairs), use_embeddings=not args.no_embeddings,
+                           full_scale_pairs=args.full_scale_pairs)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import re
 import time
 from collections.abc import Callable, Iterator, Mapping
 
@@ -16,7 +17,23 @@ from . import config
 from .evaluate import reduction_ratio
 
 #: Bit per pass in the ``passes`` column of the candidate frame.
-PASS_BITS = {"tfidf": 1, "embed": 2, "rare": 4, "digit": 8, "address": 16}
+PASS_BITS = {"tfidf": 1, "embed": 2, "rare": 4, "digit": 8, "address": 16,
+             "street": 32, "tfidf_addr": 64}
+#: Passes always present in the candidate frame / features (original five). The
+#: optional passes add their ``score_*`` column (and features) only when enabled, so
+#: a run with every new flag off is bit-identical to the original pipeline.
+BASE_PASSES = ("tfidf", "embed", "rare", "digit", "address")
+
+
+def active_passes() -> tuple[str, ...]:
+    """Pass names whose columns appear in candidate/feature frames under the current
+    config: the five base passes plus each enabled optional pass (read at call time)."""
+    extra = []
+    if config.USE_STREET_PASS:
+        extra.append("street")
+    if config.USE_TFIDF_ADDR_PASS:
+        extra.append("tfidf_addr")
+    return BASE_PASSES + tuple(extra)
 
 #: Street words too common to be address block keys.
 _ADDRESS_STOPWORDS = frozenset({
@@ -250,11 +267,36 @@ def compute_embeddings(frame: pd.DataFrame, encoder: Encoder | None = None,
     if encoder is None:
         encoder = load_encoder()
     uniq, inverse = np.unique(np.asarray(texts, dtype=object), return_inverse=True)
-    vecs = encoder(list(uniq)).astype(np.float32)[inverse]
-    if cache:
-        config.ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
-        np.save(path, vecs)
-    return vecs
+    del texts
+    # Encode unique texts in chunks into one preallocated float32 matrix, so the
+    # encoder's own per-call buffers stay chunk-sized and no full-size astype copy is
+    # made (previously ~3-4x the unique matrix was resident at the peak).
+    step = config.EMBEDDING_ENCODE_CHUNK
+    uvecs: np.ndarray | None = None
+    for s in range(0, len(uniq), step):
+        v = np.asarray(encoder(list(uniq[s:s + step])), dtype=np.float32)
+        if uvecs is None:
+            uvecs = np.empty((len(uniq), v.shape[1]), dtype=np.float32)
+        uvecs[s:s + len(v)] = v
+        del v
+    if uvecs is None:  # no records: keep the original (uncached-shape) behaviour
+        return np.asarray(encoder([]), dtype=np.float32)[inverse]
+    del uniq
+    if not cache:
+        return uvecs[inverse]
+    # Expand unique -> per-record rows straight into the on-disk cache and return the
+    # memory map (exactly what a later cache hit returns), instead of holding a second
+    # full in-memory copy.
+    config.ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp.npy")
+    out = np.lib.format.open_memmap(tmp, mode="w+", dtype=np.float32,
+                                    shape=(len(inverse), uvecs.shape[1]))
+    for s in range(0, len(inverse), step):
+        out[s:s + step] = uvecs[inverse[s:s + step]]
+    out.flush()
+    del out, uvecs
+    tmp.replace(path)
+    return np.load(path, mmap_mode="r")
 
 
 # --- passes --------------------------------------------------------------------------
@@ -266,12 +308,15 @@ def _empty_pass() -> pd.DataFrame:
                          "score": pd.Series([], dtype=np.float32)})
 
 
-def tfidf_name_pass(q_names: pd.Series, x_names: pd.Series, k: int = config.K_TFIDF_NAME
-                    ) -> pd.DataFrame:
+def tfidf_name_pass(q_names: pd.Series, x_names: pd.Series, k: int = config.K_TFIDF_NAME,
+                    index_terms: int | None = None) -> pd.DataFrame:
     """Pass 1: char 3-4-gram TF-IDF on ``name_core``, cosine top-k per query.
 
     The vectorizer is fitted on this group's queries + index. Returns positions
-    ``q`` (into ``q_names``), ``x`` (into ``x_names``) and ``score``.
+    ``q`` (into ``q_names``), ``x`` (into ``x_names``) and ``score``. Also used by
+    pass 7 on name + address text; ``index_terms`` (None = off, the name-pass
+    default) prunes each index row to its highest-weight n-grams, transforming the
+    index in chunks so the unpruned matrix is never materialised whole.
     """
     if len(q_names) == 0 or len(x_names) == 0:
         return _empty_pass()
@@ -286,7 +331,13 @@ def tfidf_name_pass(q_names: pd.Series, x_names: pd.Series, k: int = config.K_TF
     except ValueError:  # empty vocabulary
         return _empty_pass()
     queries = prune_rows(vec.transform(q_names), config.TFIDF_QUERY_TERMS)
-    q, x, s = sparse_topk(queries, vec.transform(x_names), k)
+    if index_terms is None:
+        index = vec.transform(x_names)
+    else:
+        step = 500_000
+        index = sparse.vstack([prune_rows(vec.transform(x_names.iloc[i:i + step]), index_terms)
+                               for i in range(0, len(x_names), step)], format="csr")
+    q, x, s = sparse_topk(queries, index, k)
     return pd.DataFrame({"q": q, "x": x, "score": s})
 
 
@@ -313,8 +364,15 @@ def key_pass(q_keys: pd.Series, x_keys: pd.Series, k: int, max_block: int,
     qe = q_keys.explode().dropna()
     if xe.empty or qe.empty:
         return _empty_pass()
-    x_df = pd.DataFrame({"x": xe.index.to_numpy(np.int64), "key": xe.to_numpy()})
-    q_df = pd.DataFrame({"q": qe.index.to_numpy(np.int64), "key": qe.to_numpy()})
+    # Keys are replaced by 64-bit hashes before any join: at full scale the exploded
+    # key tables hold tens of millions of rows, and uint64 keys cost 8 bytes each
+    # instead of a Python string object. Ties are broken on x, never on the key, so
+    # (collisions aside, ~n^2/2^65) the result is identical to joining on strings.
+    x_df = pd.DataFrame({"x": xe.index.to_numpy(np.int64),
+                         "key": pd.util.hash_array(xe.to_numpy(dtype=object))})
+    q_df = pd.DataFrame({"q": qe.index.to_numpy(np.int64),
+                         "key": pd.util.hash_array(qe.to_numpy(dtype=object))})
+    del xe, qe
     x_df = x_df.drop_duplicates()
     q_df = q_df.drop_duplicates()
     block = x_df["key"].value_counts()
@@ -362,11 +420,32 @@ def rare_token_pass(q: pd.DataFrame, x: pd.DataFrame, k: int = config.K_RARE_TOK
     return key_pass(q_rare, x_tok, k, config.RARE_MAX_BLOCK, idf_weight=True)
 
 
+_DIGIT_RUN_RE = re.compile(r"\d+")
+
+
+def block_digits(frame: pd.DataFrame) -> list[list[str]]:
+    """Per-record digit tokens the key passes block on (``config.BLOCK_DIGIT_SOURCE``).
+
+    ``"tokens"`` returns the normalised ``digits`` field unchanged. ``"runs"`` returns
+    every maximal digit run inside any ``addr_norm`` token, in order, leading zeros
+    stripped and de-duplicated -- so alphanumeric house numbers keep their digits
+    (``"24637b" -> "24637"``, ``"a26 1" -> "26", "1"``) -- without changing the
+    normalised fields the matcher features read. ``addr_norm`` already excludes
+    landmark text and region components, exactly as ``digits`` does.
+    """
+    if config.BLOCK_DIGIT_SOURCE == "tokens":
+        return [d.split() for d in frame["digits"]]
+    if config.BLOCK_DIGIT_SOURCE != "runs":
+        raise ValueError(f"unknown BLOCK_DIGIT_SOURCE {config.BLOCK_DIGIT_SOURCE!r}")
+    return [list(dict.fromkeys(r.lstrip("0") or "0" for r in _DIGIT_RUN_RE.findall(a)))
+            for a in frame["addr_norm"]]
+
+
 def _digit_name_keys(frame: pd.DataFrame) -> pd.Series:
     """Keys ``"<digit>|<first name token>"`` for pass 4."""
     return pd.Series([
-        [f"{d}|{f}" for d in digits.split()] if f else []
-        for digits, f in zip(frame["digits"], frame["first_token"])
+        [f"{d}|{f}" for d in ds] if f else []
+        for ds, f in zip(block_digits(frame), frame["first_token"])
     ])
 
 
@@ -377,30 +456,85 @@ def digit_token_pass(q: pd.DataFrame, x: pd.DataFrame, k: int = config.K_POSTAL_
                     idf_weight=True)
 
 
-def _address_keys(frame: pd.DataFrame, word_df: pd.Series | None = None) -> pd.Series:
-    """Address-only keys: first digit pair, and house number + two rarest street words."""
+def _street_words(addr: str, word_df: Mapping[str, int] | None) -> list[str]:
+    """Distinct alphabetic address words (len >= 3, not stopwords), rarest first."""
+    words = list(dict.fromkeys(w for w in addr.split()
+                               if len(w) >= 3 and w.isalpha() and w not in _ADDRESS_STOPWORDS))
+    if word_df is not None:
+        words.sort(key=lambda w: (word_df.get(w, 0), w))
+    return words
+
+
+def _address_keys(frame: pd.DataFrame, word_df: Mapping[str, int] | None = None) -> pd.Series:
+    """Address-only keys: first digit pair, and house number(s) + two rarest street words.
+
+    ``config.ADDRESS_KEY_MODE == "first"`` anchors the word keys on the first digit
+    token only (original behaviour); ``"all"`` builds ``digit@word`` for each of the
+    first ``ADDRESS_MAX_DIGITS`` digit tokens. Digit tokens come from
+    :func:`block_digits`.
+    """
+    mode = config.ADDRESS_KEY_MODE
+    if mode not in ("first", "all"):
+        raise ValueError(f"unknown ADDRESS_KEY_MODE {mode!r}")
     keys = []
-    for addr, digits in zip(frame["addr_norm"], frame["digits"]):
-        ds = digits.split()
+    for addr, ds in zip(frame["addr_norm"], block_digits(frame)):
         ks: list[str] = []
         if len(ds) >= 2:
             ks.append(f"{ds[0]}#{ds[1]}")
         if ds:
-            words = [w for w in addr.split()
-                     if len(w) >= 3 and w.isalpha() and w not in _ADDRESS_STOPWORDS]
-            words = list(dict.fromkeys(words))
-            if word_df is not None:
-                words.sort(key=lambda w: (word_df.get(w, 0), w))
-            ks.extend(f"{ds[0]}@{w}" for w in words[:2])
-        keys.append(ks)
-    return pd.Series(keys)
+            words = _street_words(addr, word_df)[:2]
+            anchors = ds[:1] if mode == "first" else ds[:config.ADDRESS_MAX_DIGITS]
+            ks.extend(f"{d}@{w}" for d in anchors for w in words)
+        keys.append(list(dict.fromkeys(ks)))
+    return pd.Series(keys, dtype=object)
+
+
+def _street_keys(frame: pd.DataFrame, word_df: Mapping[str, int]) -> pd.Series:
+    """Pass-6 keys: unordered pairs of the ``STREET_WORDS`` rarest street words."""
+    keys = []
+    for addr in frame["addr_norm"]:
+        w = _street_words(addr, word_df)[:config.STREET_WORDS]
+        keys.append([f"{a}+{b}" if a < b else f"{b}+{a}"
+                     for i, a in enumerate(w) for b in w[i + 1:]])
+    return pd.Series(keys, dtype=object)
+
+
+def _address_word_df(q: pd.DataFrame, x: pd.DataFrame) -> dict[str, int]:
+    """Address-word frequencies over one group's queries + index."""
+    return pd.concat([q["addr_norm"], x["addr_norm"]]).str.split().explode().value_counts().to_dict()
+
+
+def street_pass(q: pd.DataFrame, x: pd.DataFrame, k: int | None = None,
+                word_df: Mapping[str, int] | None = None) -> pd.DataFrame:
+    """Pass 6: records sharing a pair of rare street words (no digit needed)."""
+    word_df = _address_word_df(q, x) if word_df is None else word_df
+    return key_pass(_street_keys(q, word_df), _street_keys(x, word_df),
+                    config.K_STREET if k is None else k, config.STREET_MAX_BLOCK,
+                    idf_weight=True)
+
+
+def name_addr_text(frame: pd.DataFrame) -> pd.Series:
+    """Text for pass 7: ``name_core + " " + addr_norm`` (stripped)."""
+    return (frame["name_core"] + " " + frame["addr_norm"]).str.strip()
+
+
+def tfidf_addr_pass(q: pd.DataFrame, x: pd.DataFrame, k: int | None = None) -> pd.DataFrame:
+    """Pass 7: char TF-IDF top-k on name + address text.
+
+    Same vectorizer settings and query pruning as the name pass (via
+    :func:`tfidf_name_pass`); additionally, when ``TFIDF_ADDR_INDEX_TERMS`` is set,
+    index rows are pruned to that many highest-weight n-grams to bound the index
+    matrix at full scale.
+    """
+    return tfidf_name_pass(name_addr_text(q), name_addr_text(x),
+                           k=config.K_TFIDF_ADDR if k is None else k,
+                           index_terms=config.TFIDF_ADDR_INDEX_TERMS)
 
 
 def address_pass(q: pd.DataFrame, x: pd.DataFrame, k: int = config.K_ADDRESS
                  ) -> pd.DataFrame:
     """Pass 5: address-only keys, for matches whose names differ entirely."""
-    words = pd.concat([q["addr_norm"], x["addr_norm"]]).str.split().explode()
-    word_df = words.value_counts()
+    word_df = _address_word_df(q, x)
     return key_pass(_address_keys(q, word_df), _address_keys(x, word_df), k,
                     config.ADDRESS_MAX_BLOCK, idf_weight=True)
 
@@ -426,7 +560,7 @@ def generate_candidates(
         within_country: block within each country string.
         use_address_pass: include pass 5.
         verbose: print per-group progress.
-        k_overrides: optional ``{pass_name: k}`` (keys from ``PASS_BITS``, i.e.
+        k_overrides: optional ``{pass_name: k}`` (keys from ``PASS_BITS``, e.g.
             ``"tfidf"``/``"embed"``/``"rare"``/``"digit"``/``"address"``) to run a pass
             at a k other than its ``config.K_*`` default. Missing keys keep the
             default k for that pass. ``None`` (the default) reproduces production
@@ -460,8 +594,15 @@ def generate_candidates(
                 k=ko.get("embed", config.K_EMBEDDING))
         if use_address_pass:
             runs["address"] = lambda: address_pass(q, x, k=ko.get("address", config.K_ADDRESS))
+        if config.USE_STREET_PASS:
+            runs["street"] = lambda: street_pass(q, x, k=ko.get("street", config.K_STREET))
+        if config.USE_TFIDF_ADDR_PASS:
+            runs["tfidf_addr"] = lambda: tfidf_addr_pass(
+                q, x, k=ko.get("tfidf_addr", config.K_TFIDF_ADDR))
         for name, run in runs.items():
+            t_pass = time.time()
             res = run()
+            t_pass = time.time() - t_pass
             res = pd.DataFrame({
                 "q": q_idx[res["q"].to_numpy()],
                 "x": x_idx[res["x"].to_numpy()],
@@ -470,11 +611,11 @@ def generate_candidates(
             })
             frames.append(res)
             if verbose:
-                _log(f"{country}: pass {name} -> {len(res):,} pairs")
+                _log(f"{country}: pass {name} -> {len(res):,} pairs ({t_pass:.1f}s)")
         if verbose:
             _log(f"{country}: {len(q_idx):,} S1 x {len(x_idx):,} others in "
                  f"{time.time() - t0:.1f}s")
-    score_cols = [f"score_{p}" for p in PASS_BITS]
+    score_cols = [f"score_{p}" for p in active_passes()]
     cols = ["s1_id", "cand_id", "passes"] + score_cols
     if not frames:
         empty = {c: pd.Series(dtype=object) for c in cols[:2]}
@@ -546,7 +687,8 @@ def report_blocking_stats(
         "n_pairs": float(len(in_scope)),
     }
     all_passes = in_scope["passes"].to_numpy()
-    for name, bit in PASS_BITS.items():
+    for name in active_passes():
+        bit = PASS_BITS[name]
         stats[f"pairs_{name}"] = float(((all_passes & bit) > 0).sum())
         stats[f"recall_{name}"] = float(((passes & bit) > 0).sum()) / n_true
         stats[f"unique_{name}"] = float((passes == bit).sum()) / n_true

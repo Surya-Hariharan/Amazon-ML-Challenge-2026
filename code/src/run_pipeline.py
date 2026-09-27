@@ -120,6 +120,21 @@ def _frame_key(*parts) -> str:
     return h.hexdigest()[:16]
 
 
+def code_version(*modules: str) -> str:
+    """Short hash of the source of ``src/<module>.py`` files, for cache keys.
+
+    Cached normalisation/blocking artifacts are keyed on their *inputs*; without this
+    a change to ``normalize.py``/``blocking.py`` would silently reuse artifacts built
+    by the old code. Line endings are normalised so Windows and Linux checkouts of
+    the same commit produce the same key.
+    """
+    h = hashlib.sha1()
+    for m in modules:
+        h.update(m.encode())
+        h.update((Path(__file__).parent / f"{m}.py").read_bytes().replace(b"\r\n", b"\n"))
+    return h.hexdigest()[:12]
+
+
 def _cached(name: str, key: str, fn: Callable[[], pd.DataFrame], use_cache: bool) -> pd.DataFrame:
     """Load ``artifacts/<name>_<key>.parquet`` or compute and store it (CLAUDE.md §7)."""
     path = config.ARTIFACTS_DIR / f"{name}_{key}.parquet"
@@ -140,7 +155,8 @@ def _normalize_and_cache(name: str, raw: pd.DataFrame, use_cache: bool) -> pd.Da
     exact same cache keys/paths (``norm_<name>_<hash>.parquet``) when it loads
     a source from disk instead of receiving it already in memory.
     """
-    return _cached(f"norm_{name}", _frame_key(raw), lambda: normalize_frame(raw), use_cache)
+    return _cached(f"norm_{name}", _frame_key(raw, code_version("normalize")),
+                   lambda: normalize_frame(raw), use_cache)
 
 
 def _normalize_one(name: str, path: Path, use_cache: bool) -> pd.DataFrame:
@@ -233,7 +249,7 @@ def block(prep: dict, use_cache: bool = True) -> pd.DataFrame:
     knobs = [getattr(config, k) for k in config.TUNABLES if k not in
              ("MATCH_THRESHOLD", "SINGLETON_THRESHOLD", "ONE_TO_ONE", "TRAIN_SAMPLE_FRAC")]
     key = _frame_key(prep["s1"][[config.ID_COL]], prep["others"][[config.ID_COL]],
-                     prep["emb"] is not None, knobs)
+                     prep["emb"] is not None, knobs, code_version("blocking", "normalize"))
     return _cached("cands", key, lambda: generate_candidates(
         prep["s1"], prep["others"], embeddings=prep["emb"]), use_cache)
 
