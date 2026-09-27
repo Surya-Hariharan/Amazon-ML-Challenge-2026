@@ -1,19 +1,19 @@
 # experiments/
 
-Scaffolding for human-curated experiment records, separate from the machine-generated
-`experiments.csv` (see [`../docs/experiments/README.md`](../docs/experiments/README.md)
-for how the two relate). All four subdirectories are currently empty (each holds only a
-`.gitkeep` placeholder) — nothing has been run into them yet as of this reorganisation.
+Standalone experiment drivers that run the unmodified pipeline and record results. They
+never modify `code/src/` or write to `output/`.
 
-| Directory | Purpose | Tracked in git? |
+| Script | Purpose | Output |
 | --- | --- | --- |
-| `configs/` | Saved `config.py`-equivalent snapshots (e.g. a JSON/YAML dump of the tunables in `config.TUNABLES`) for a run worth reproducing later. Small, human-readable. | Yes |
-| `reports/` | Short written summaries of an experiment round (e.g. the CP6 error-analysis writeup, a LOCO robustness summary). Small, human-readable. | Yes |
-| `logs/` | Raw run logs / stdout captures from pipeline invocations. Can grow large and is regenerated freely. | No — gitignored (`experiments/logs/*`) |
-| `results/` | Exported metric tables, plots, or larger result dumps tied to a specific experiment. Can grow large. | No — gitignored (`experiments/results/*`) |
+| [`scripts/run_baseline_experiment.py`](scripts/run_baseline_experiment.py) | Runs `run_pipeline.valid_run` on a seeded S1 sample and dumps every metric plus extra diagnostics (feature separability, threshold sweep, error budget, resource usage) | `results/<tag>.json` |
+| [`scripts/source_recall.py`](scripts/source_recall.py) | Blocking recall split by candidate source (S2 vs S3) | `results/n10000_source_recall.json` |
+| [`scripts/make_figures.py`](scripts/make_figures.py) | Plots from the JSON results (requires `matplotlib`) | `reports/figures/*.png` |
 
-`configs/` and `reports/` are kept trackable because they are expected to stay small and
-are meant to be read by teammates; `logs/` and `results/` are ignored because they are
-regenerable and can grow without bound — consistent with how `artifacts/` (caches,
-trained models, OOF predictions) and `experiments.csv` are already gitignored per
-`CLAUDE.md` §3/§5.
+```bash
+python experiments/scripts/run_baseline_experiment.py 10000 n10000   # <n_s1> <tag>
+python experiments/scripts/make_figures.py
+```
+
+`logs/`, `results/` and `reports/` hold generated files and are not versioned. A summary
+of the results lives in [`docs/results.md`](../docs/results.md); in-pipeline diagnostics
+(`python -m src.diagnose`) write to `code/artifacts/diagnostics/` instead.

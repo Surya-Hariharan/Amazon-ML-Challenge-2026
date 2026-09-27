@@ -32,7 +32,7 @@ from src.model import train_oof, train_full, predict  # noqa: E402
 from src.decide import tune_threshold, apply_threshold  # noqa: E402
 from src.evaluate import score_report  # noqa: E402
 
-TOTAL_TRAIN_S1 = 2_206_821  # from CLAUDE.md / prior audit, verified below
+TOTAL_TRAIN_S1 = 2_206_821  # full train S1 count, verified below
 
 
 def main():

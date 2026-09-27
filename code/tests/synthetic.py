@@ -1,6 +1,6 @@
 """Small deterministic synthetic ER dataset for tests (no real data is ever loaded).
 
-Mimics the CP1 audit patterns at toy scale: clean S1 records; S2/S3 copies with caps,
+Mimics the training-data noise patterns at toy scale: clean S1 records; S2/S3 copies with caps,
 abbreviations, dropped/reordered suffixes, typos, honorific prefixes, DBA forms, junk
 prefixes and empty addresses; S1 "chain" names shared across different addresses;
 orphan S2/S3 records; ~6% singletons; and a third country with French-style records.

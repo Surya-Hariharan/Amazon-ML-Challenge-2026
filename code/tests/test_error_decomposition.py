@@ -1,4 +1,4 @@
-"""Tests for src.error_decomposition (roadmap v3 Phase 0, E1)."""
+"""Tests for src.error_decomposition (error-decomposition diagnostic)."""
 
 import pandas as pd
 import pytest

@@ -1,4 +1,4 @@
-"""CLI for roadmap-v3 Phase-0 diagnostics: baseline, LOCO, drift, sample-size
+"""Measurement-only diagnostics CLI: baseline, LOCO, drift, sample-size
 convergence, staged resource qualification, and error decomposition.
 
 This module only *calls* the existing pipeline (``run_pipeline``, ``blocking``,
@@ -10,7 +10,7 @@ measurement (env/hash/resource logging, distribution comparison, and failure-
 stage classification) and writes its own diagnostic artifacts under
 ``artifacts/diagnostics/``.
 
-Usage (from code/business_entity_resolution/)::
+Usage (from code/)::
 
     python -m src.diagnose baseline [--sample 0.1] [--loco] [--no-embeddings]
     python -m src.diagnose drift [--sample 0.1] [--with-candidates] [--no-embeddings]
@@ -165,8 +165,7 @@ def run_convergence(sizes: list[int], use_embeddings: bool = config.USE_EMBEDDIN
     (each converted to the equivalent ``TRAIN_SAMPLE_FRAC`` via
     ``N / len(s1)``, clipped to 1.0) calls ``run_pipeline.valid_run`` on
     ``run_pipeline.subsample_train``'s output for that fraction -- i.e. every
-    other setting (config, architecture, seed) is held fixed, exactly as
-    roadmap v3 requires. Returns one row per size with pair recall, S1 full
+    other setting (config, architecture, seed) is held fixed. Returns one row per size with pair recall, S1 full
     recall, mean candidates, total candidate pairs, precision, recall, macro
     F0.5 and runtime; also written to ``artifacts/diagnostics/convergence_<ts>.tsv``.
 
@@ -286,9 +285,8 @@ _STAGES: dict[str, Callable[[], dict]] = {
 def run_resource_stage(stage: str) -> list[dict]:
     """E2: run one (or, for ``"all"``, every) resource-qualification stage.
 
-    Stops after the first failing stage (per roadmap v3 O0: "if a stage
-    fails, STOP -- do not redesign the architecture automatically, report the
-    exact failure"). Each stage's report is written to
+    Stops after the first failing stage and reports the exact failure rather
+    than attempting any automatic workaround. Each stage's report is written to
     ``artifacts/diagnostics/stage_<name>_<timestamp>.json`` by
     :func:`diagnostics.run_stage`; this function also prints a one-line
     summary per stage.
@@ -442,7 +440,7 @@ def run_blocking_ablation(
     Loads the training split once (via ``run_pipeline._load_train``, the same
     helper ``errors``/``convergence`` use) and normalises + embeds it once
     (via the existing, unmodified ``run_pipeline.prepare``, with its normal
-    on-disk normalisation/embedding caches, per CLAUDE.md 7 -- embeddings are
+    on-disk normalisation/embedding caches -- embeddings are
     never recomputed per configuration). For every configuration in
     :func:`blocking_ablation_configs`, calls the existing, unmodified
     ``blocking.generate_candidates`` -- the same union/de-duplication code
@@ -514,7 +512,7 @@ def run_blocking_ablation(
 # --- P1-downstream: blocking-K OOF validation ---------------------------------------------
 
 #: The 4 Pareto-competitive configurations P1's blocking-only screening surfaced
-#: (roadmap v3 P1 follow-up). Unlike ``_ABLATION_SWEEPS`` (16 one-factor-at-a-time
+#: (follow-up to the ablation screen). Unlike ``_ABLATION_SWEEPS`` (16 one-factor-at-a-time
 #: blocking-only rows), this is a small, fixed, *named* set run through the full
 #: downstream pipeline (features -> LightGBM -> threshold -> decision), in this
 #: exact order, because that ordering is part of the deliverable.
@@ -1722,7 +1720,7 @@ def run_loco_comparison(sample: float = 0.0045, use_embeddings: bool = True) -> 
     seed -- see :data:`LOCO_CONFIGS`'s docstring) across every country-held-out
     direction actually present in the sampled training data.
 
-    France is never a training country (CLAUDE.md: train has only US/India, France
+    France is never a training country (train has only US/India, France
     is test-only), so it can never appear as a LOCO direction here -- this is
     verified against the loaded sample's own country set (not assumed) and recorded
     explicitly in the JSON sidecar's ``limitations`` list, per the task's requirement
@@ -1747,7 +1745,7 @@ def run_loco_comparison(sample: float = 0.0045, use_embeddings: bool = True) -> 
     limitations = [
         f"Countries present in this sample's training data: {countries}. LOCO "
         "directions were computed only for these -- France has no labeled training "
-        "records in the train split at all (CLAUDE.md: train is US/India only, "
+        "records in the train split at all (train is US/India only, "
         "France is test-only), so it cannot be evaluated as a supervised LOCO "
         "holdout (there is no remaining-country model to train it against, and no "
         "France ground truth to score it with). No France LOCO result is reported "
@@ -1840,7 +1838,7 @@ FEATURE_MEANINGS: dict[str, str] = {
     "long_num_equal": "1.0 iff any long numeric token (e.g. a full PIN/ZIP) is shared; NaN if either side has none.",
     "landmark_jaccard": "Jaccard overlap of parsed landmark-phrase tokens ('near X', 'opp Y').",
     "region_equal": "1.0/0.0/NaN: whether a parsed region/state token matches.",
-    "same_country": "1.0 iff the two records' raw country strings are identical (the only country-derived feature; CLAUDE.md §2.4).",
+    "same_country": "1.0 iff the two records' raw country strings are identical (the only country-derived feature).",
     "emb_cos": "Cosine similarity of the multilingual sentence-embedding vectors (name+address); NaN if embeddings were not computed.",
     "in_tfidf": "1.0 iff this pair was produced by the TF-IDF name-cosine blocking pass.",
     "in_embed": "1.0 iff this pair was produced by the dense-embedding blocking pass.",
@@ -1863,8 +1861,7 @@ FEATURE_MEANINGS: dict[str, str] = {
     "is_s3": "1.0 iff the candidate is from Source 3, 0.0 if Source 2.",
 }
 
-#: Feature -> family, read against CLAUDE.md §6.3's grouping plus the task's Part 5
-#: buckets. Assigned by hand against ``features.py`` rather than inferred from name
+#: Feature -> family, following the feature grouping in ``features.py``. Assigned by hand against ``features.py`` rather than inferred from name
 #: prefixes at runtime, since a couple of features (``name_tfidf_cos``,
 #: ``addr_tfidf_cos``, ``digit_*``/``house_equal``/``long_num_equal``) belong to a
 #: more specific family (TF-IDF, NUMERIC/DIGIT) than a naive "name_"/"addr_" prefix

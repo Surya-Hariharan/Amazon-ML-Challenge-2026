@@ -179,7 +179,7 @@ def test_submission_key_for_local_path_no_tag():
 
 
 def test_submission_key_for_local_path_with_tag():
-    """With a tag, submissions nest under submissions/<tag>/ (CLAUDE.md §7 tags)."""
+    """With a tag, submissions nest under submissions/<tag>/ (sub-d{day}-{n} tags)."""
     path = Path("output/candidate_pairs.tsv")
     key = s3_sync.submission_key_for_local_path(path, tag="sub-d1-1")
     assert key == "submissions/sub-d1-1/candidate_pairs.tsv"

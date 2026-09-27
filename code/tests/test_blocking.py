@@ -81,7 +81,7 @@ def test_dense_topk_gpu_path_if_available():
     """The torch (FP32) path agrees exactly with brute force -- no FP16 tolerance needed.
 
     dense_topk's CUDA branch computes the similarity matmul in float32 (never
-    float16, per CLAUDE.md's FP32 retrieval requirement -- see
+    float16, per the FP32 retrieval requirement -- see
     test_dense_topk_cuda_branch_never_requests_float16 for a host-independent
     regression guard on that). With a real CUDA device this exercises that branch
     directly; it is skipped where no CUDA device is available.

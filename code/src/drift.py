@@ -1,10 +1,10 @@
-"""Label-free train-vs-test distribution comparison (roadmap v3 Phase 0, E-drift).
+"""Label-free train-vs-test distribution comparison (drift diagnostic).
 
 Every covariate here is computable from S1/S2/S3 fields and
 ``normalize.normalize_frame`` alone -- no ground truth is used, so this is
 safe to run on the real, unlabelled test split. Distinguishes STATISTICAL
 difference (KS test) from PRACTICAL / potentially relevant distribution shift
-(Cohen's d effect size) per roadmap v3's instruction not to rely on p-values
+(Cohen's d effect size), rather than relying on p-values
 alone: a large sample can make a trivial shift "significant" (tiny p-value,
 tiny d), and a small slice can hide a real shift behind a large p-value.
 """

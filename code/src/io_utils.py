@@ -1,8 +1,8 @@
 """TSV load/save, ID-list formatting and the submission writer.
 
-All TSV I/O goes through here so the ``sep="\\t"`` / string-ID rules (CLAUDE.md §2.3)
+All TSV I/O goes through here so the ``sep="\\t"`` / string-ID rules
 are applied in exactly one place. :func:`write_submission` enforces every output-format
-rule from CLAUDE.md §2.5 and refuses to write a file that would break one.
+rule from the challenge specification and refuses to write a file that would break one.
 """
 
 from collections.abc import Collection, Iterable, Mapping, Sequence
@@ -96,7 +96,7 @@ def write_submission(
 ) -> tuple[Path, Path]:
     """Write ``matching_results.tsv`` and ``candidate_pairs.tsv`` after validating them.
 
-    Rules enforced (CLAUDE.md §2.5):
+    Rules enforced (challenge output specification):
 
     * exactly one row per S1 ID, in ``s1_ids`` order; ``s1_ids`` must be unique S1- IDs;
     * S1 IDs missing from ``matches``/``candidates`` get an empty list; keys that are

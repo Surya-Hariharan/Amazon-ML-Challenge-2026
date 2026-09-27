@@ -1,7 +1,7 @@
 # Pretrained models used
 
 Every pretrained model in the final pipeline must be MIT or Apache-2.0 licensed and
-≤ 8B parameters (CLAUDE.md §2.2). Add a row *before* the model is used.
+≤ 8B parameters (challenge constraint 5). Every model is recorded here before it is used.
 
 | Model | Licence | Parameters | Model card URL | Used in | Verified by / date |
 |-------|---------|------------|----------------|---------|--------------------|

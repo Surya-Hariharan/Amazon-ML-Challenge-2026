@@ -1,4 +1,4 @@
-"""True-match failure-stage classification (roadmap v3 Phase 0, E1).
+"""True-match failure-stage classification (error-decomposition diagnostic).
 
 For every train ground-truth true pair, classifies which stage lost it:
 

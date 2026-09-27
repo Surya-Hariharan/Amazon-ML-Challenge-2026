@@ -282,7 +282,7 @@ def test_run_chunk_equality_exact_equal_pass_status_on_identical_chunk_sizes(
 
 
 def test_run_chunk_equality_never_writes_output_dir(isolated, train_files):
-    """A diagnostic-layer experiment must never touch output/ (CLAUDE.md 5 rule)."""
+    """A diagnostic-layer experiment must never touch output/."""
     before = sorted(config.OUTPUT_DIR.iterdir()) if config.OUTPUT_DIR.exists() else None
     diagnose.run_chunk_equality(sample=1.0, encoder=fake_encoder)
     after = sorted(config.OUTPUT_DIR.iterdir()) if config.OUTPUT_DIR.exists() else None
@@ -320,7 +320,7 @@ def test_run_fp16_retrieval_end_to_end_writes_report_with_required_fields(
 
 
 def test_run_fp16_retrieval_never_writes_output_dir(isolated, train_files):
-    """A diagnostic-layer experiment must never touch output/ (CLAUDE.md 5 rule)."""
+    """A diagnostic-layer experiment must never touch output/."""
     before = sorted(config.OUTPUT_DIR.iterdir()) if config.OUTPUT_DIR.exists() else None
     diagnose.run_fp16_retrieval(sample=1.0, encoder=fake_encoder)
     after = sorted(config.OUTPUT_DIR.iterdir()) if config.OUTPUT_DIR.exists() else None

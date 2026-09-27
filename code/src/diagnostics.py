@@ -1,4 +1,4 @@
-"""Environment, hashing and resource-usage instrumentation (roadmap v3 Phase 0).
+"""Environment, hashing and resource-usage instrumentation for diagnostics.
 
 Measurement infrastructure only. Nothing here changes normalisation, blocking,
 feature, model, decision or submission behaviour -- every function is read-only
@@ -213,8 +213,7 @@ def run_stage(
 
     Times ``fn()``, tracks peak RSS/GPU memory and disk usage before/after,
     and catches any exception so a failing stage produces a clear failure
-    report instead of crashing the qualification run (roadmap v3 O0: "if a
-    stage fails, STOP and report the exact failure" -- the caller, not this
+    report instead of crashing the qualification run (the caller, not this
     function, decides whether to stop and move on).
 
     Returns a JSON-serialisable dict with ``name``, ``success``, ``start``,

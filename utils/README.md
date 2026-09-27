@@ -7,7 +7,7 @@ local run must match theirs exactly.
 ## `validate_submission.py`
 
 Stdlib-only (Python 3.8+, no dependencies) validator for the two submission files. Run
-it before every leaderboard upload (CLAUDE.md §2 rule 6):
+it before every leaderboard upload:
 
 ```bash
 python3 utils/validate_submission.py \

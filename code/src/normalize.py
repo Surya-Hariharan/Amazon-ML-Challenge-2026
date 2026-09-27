@@ -1,6 +1,6 @@
-"""Name/address normalisation, token and number extraction (CLAUDE.md §6.1).
+"""Name/address normalisation, token and number extraction.
 
-Design inputs (CP1 audit):
+Design inputs (training-data audit):
 
 * S1 is clean title case. S2 is often ALL CAPS with abbreviated addresses and Indian
   states/cities (sometimes whole names) in native Indic scripts. S3 adds honorific
@@ -13,7 +13,7 @@ Design inputs (CP1 audit):
 * France appears only in test: accents, French legal forms and street words.
 
 Everything here is language-agnostic string processing plus hand-written dictionaries
-(allowed by CLAUDE.md §2.1). Country is never used to choose a code path, so an unseen
+(code, not external data lookup). Country is never used to choose a code path, so an unseen
 country flows through unchanged. Indic scripts are transliterated to Latin with one
 table shared by all nine ISCII-derived Unicode blocks, which have parallel layouts.
 """

@@ -1,6 +1,6 @@
 """Evaluation metrics: macro F0.5 per S1 entity, blocking recall, reduction ratio.
 
-Scoring rule (CLAUDE.md §1): for every S1 entity compute F-beta (beta = 0.5) between
+Scoring rule (official challenge metric): for every S1 entity compute F-beta (beta = 0.5) between
 its predicted and true S2/S3 ID sets, then average over *all* S1 entities, singletons
 included:
 

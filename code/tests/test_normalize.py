@@ -1,4 +1,4 @@
-"""Tests for src.normalize on hand-written strings mimicking the CP1 noise patterns."""
+"""Tests for src.normalize on hand-written strings mimicking the training-data noise patterns."""
 
 import pandas as pd
 import pytest

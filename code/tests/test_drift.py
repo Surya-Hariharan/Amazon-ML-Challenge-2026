@@ -1,4 +1,4 @@
-"""Tests for src.drift (roadmap v3 Phase 0, E-drift)."""
+"""Tests for src.drift (drift diagnostic)."""
 
 import numpy as np
 import pandas as pd

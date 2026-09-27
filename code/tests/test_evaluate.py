@@ -29,7 +29,7 @@ def test_worked_example():
     ],
 )
 def test_singleton_and_edge_cases(pred, truth, expected):
-    """Singleton rules from CLAUDE.md §1 plus exact/no-overlap cases."""
+    """Singleton rules from the challenge metric plus exact/no-overlap cases."""
     assert fbeta_single(pred, truth) == expected
 
 

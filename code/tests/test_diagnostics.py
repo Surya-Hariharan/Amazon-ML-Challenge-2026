@@ -1,4 +1,4 @@
-"""Tests for src.diagnostics (roadmap v3 Phase 0 instrumentation)."""
+"""Tests for src.diagnostics (diagnostics instrumentation)."""
 
 import json
 

@@ -1,4 +1,21 @@
+"""Candidate generation (blocking): multi-pass union of S2/S3 neighbours per S1.
 
+Blocking sets the recall ceiling of the whole pipeline -- a true match missed here is
+never scored. Each pass runs within records sharing the same country string (country
+stays an open set) and contributes its top-k neighbours per S1:
+
+1. ``tfidf`` -- character 3-4-gram TF-IDF cosine on ``name_core``.
+2. ``embed`` -- dense multilingual embeddings of name + address (exact fp32 top-k).
+3. ``rare`` -- shared high-IDF name tokens.
+4. ``digit`` -- shared digit run plus shared first name token.
+5. ``address`` -- ``digit@street-word`` address keys.
+6. ``street`` -- unordered pairs of rare alphabetic address words (optional).
+7. ``tfidf_addr`` -- character TF-IDF on ``name_core + addr_norm`` (optional).
+
+The union carries a per-pass bitmask and score columns, which become model features.
+Every pass is chunked (see the ``*_CHUNK`` / ``*_NNZ`` settings in ``config``) so
+memory stays bounded at full test scale.
+"""
 
 from __future__ import annotations
 
@@ -154,8 +171,8 @@ def dense_topk(
     scored against every query chunk. Peak memory is about
     ``query_chunk * index_chunk`` scores plus ``n_queries * k`` running results, so it
     scales to millions of rows per side. Rows should be L2-normalised (cosine).
-    The similarity matmul runs in float32 on every device, CPU or CUDA (CLAUDE.md
-    production decision: embedding retrieval must remain FP32 -- a CUDA float16 matmul
+    The similarity matmul runs in float32 on every device, CPU or CUDA (production
+    decision: embedding retrieval must remain FP32 -- a CUDA float16 matmul
     was measured by ``diagnose.run_fp16_retrieval`` to carry a real true-match-loss
     risk at full scale and was never approved for production).
     Returns flat ``(query_row, index_row, score)`` arrays.
@@ -254,8 +271,8 @@ def compute_embeddings(frame: pd.DataFrame, encoder: Encoder | None = None,
                        cache: bool = True) -> np.ndarray:
     """Return L2-normalised float32 embeddings for every row of ``frame``.
 
-    Cached in ``artifacts/embf32_<hash>.npy`` keyed by input texts + model (CLAUDE.md
-    §7), so blocking and features share one encoding pass per split. Stored and
+    Cached in ``artifacts/embf32_<hash>.npy`` keyed by input texts + model,
+    so blocking and features share one encoding pass per split. Stored and
     reloaded at float32 -- the same precision ``dense_topk`` retrieves at on every
     device -- never float16, so a cache hit can never silently hand FP32-retrieval
     code lower-precision vectors than it was validated on.
@@ -681,7 +698,7 @@ def report_blocking_stats(
     s1_country: Mapping[str, str] | None = None,
     verbose: bool = True,
 ) -> dict[str, float]:
-    """Blocking quality for docs/planning/plan.md CP3: recall, candidates/S1, reduction ratio.
+    """Blocking quality report: recall, candidates/S1, reduction ratio.
 
     Args:
         cands: output of :func:`generate_candidates`.

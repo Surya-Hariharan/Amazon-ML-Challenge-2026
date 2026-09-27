@@ -1,19 +1,11 @@
 # Amazon ML Challenge 2026 — Problem Statement
 
-```
-Source:  6ab5628d5a817_amazon_ml_challenge_problem_statement.pdf
-Status:  Authoritative challenge documentation
-Purpose: The official problem statement — entity-resolution task definition, dataset
-         schema, output format, submission package structure, evaluation metric, and
-         fair-play rules. Do not contradict this document with project assumptions;
-         update project docs/code to match it, not the other way around.
-```
-
-This file is a faithful, unabridged transcription of the official PDF. Terminology,
-formulas, filenames, and examples are preserved exactly as written by the organizers.
-See also [`guidelines.md`](guidelines.md) for the operational rules (challenge window,
-submission limits, leaderboard mechanics, top-100 requirements) from the companion
-"Guidelines and Key Instructions" document.
+> **Source:** official organizer PDF (`amazon_ml_challenge_problem_statement.pdf`).
+> This is a faithful, unabridged transcription — terminology, formulas, filenames and
+> examples are preserved exactly as written by the organizers. Paths such as
+> `student_resource/` refer to the organizer's starter bundle, not to this repository.
+> For the operational rules (challenge window, submission limits, leaderboard
+> mechanics, top-100 requirements) see [challenge-guidelines.md](challenge-guidelines.md).
 
 ## Business Entity Resolution Challenge
 
@@ -30,8 +22,8 @@ records from Source 2 and Source 3 for each Source 1 entity. A Source 1 entity m
 zero, one, or many records from Source 2 and Source 3.
 
 Please refer to this video for a better understanding of the problem statement: *Click
-Here* (link provided in the original PDF; not reproduced here — see the PDF itself in
-`resources/student_resource.zip` or the challenge portal).
+Here* (link provided in the original PDF; not reproduced here — see the challenge
+portal).
 
 ## File Format
 
@@ -345,4 +337,4 @@ skills using only the provided training data.
 
 For the operational rules — challenge window, submissions-per-day limit, top-100 team
 requirements, simultaneous-login restrictions, and technical support — see
-[`guidelines.md`](guidelines.md).
+[challenge-guidelines.md](challenge-guidelines.md).

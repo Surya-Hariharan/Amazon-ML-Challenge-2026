@@ -1,4 +1,4 @@
-"""Smoke tests for src.diagnose (roadmap v3 Phase 0 CLI), on synthetic data only.
+"""Smoke tests for src.diagnose (diagnostics CLI), on synthetic data only.
 
 These exercise the orchestration (baseline/LOCO logging, convergence looping,
 error-decomposition wiring, drift comparison, and the resource-qualification

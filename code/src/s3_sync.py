@@ -1,4 +1,4 @@
-"""Opt-in S3 persistence utility for the SageMaker workflow (CLAUDE.md §3).
+"""Opt-in S3 persistence utility for the SageMaker workflow.
 
 Context: each SageMaker notebook instance is a separate machine with its own empty,
 ephemeral local disk. ``s3://tensortrio`` (configured via the ``BER_S3_ROOT`` env var,
@@ -16,14 +16,14 @@ layer between that persistent bucket and the local working copy:
 * :func:`upload_submissions` — local ``output/matching_results.tsv`` and
   ``output/candidate_pairs.tsv`` -> ``s3://<root>/submissions/``.
 
-Design rules this module obeys (do not relax without updating CLAUDE.md):
+Design rules this module obeys (do not relax without updating docs/development.md):
 
 1. **No import-time side effects.** ``import s3_sync`` never touches the network, the
    filesystem beyond what Python itself does, or requires AWS credentials or boto3 to
    be installed. Every public function is independently callable and opt-in.
 2. **boto3 is lazily imported**, only inside the functions that actually perform S3
    I/O (via :func:`_get_client`), because boto3 is *not* a pinned dependency of the
-   normal ML pipeline (CLAUDE.md forbids adding it to ``code/requirements.txt`` in this
+   normal ML pipeline (it is deliberately kept out of ``code/requirements.txt`` in this
    change). If boto3 is not installed, calling an S3 operation raises a clear
    ``RuntimeError`` — never at import time.
 3. **Pure logic is separated from I/O.** All local-path <-> S3-key mapping is done by
@@ -161,7 +161,7 @@ def experiments_key_for_local_path(local_path: Path, experiments_dir: Path) -> s
 def extra_experiment_files() -> dict[Path, str]:
     """Return the files outside ``experiments/`` that :func:`upload_experiments` also syncs.
 
-    The audit (``experiments/reports/sagemaker_storage_adaptability_audit.md``) found
+    There are
     three items that a naive ``experiments/`` directory sync would miss because they
     physically live elsewhere on disk:
 
@@ -190,7 +190,7 @@ def submission_key_for_local_path(local_path: Path, tag: str | None = None) -> s
     """Map a local ``output/*.tsv`` file to its S3 key under ``<root>/submissions/``.
 
     ``tag`` optionally nests the upload under ``submissions/<tag>/...`` so repeated
-    submissions don't overwrite each other (CLAUDE.md §7's ``sub-d{day}-{n}`` tags).
+    submissions don't overwrite each other (the ``sub-d{day}-{n}`` submission tags).
     """
     if tag:
         return join_key("submissions", tag, local_path.name)
@@ -350,7 +350,7 @@ def upload_submissions(output_dir: Path | None = None, tag: str | None = None) -
     uploading a partial submission.
 
     ``tag`` optionally nests the upload under ``submissions/<tag>/...`` (see
-    :func:`submission_key_for_local_path`), matching CLAUDE.md §7's
+    :func:`submission_key_for_local_path`), matching the project's
     ``sub-d{day}-{n}`` submission tags.
     """
     root = get_s3_root()

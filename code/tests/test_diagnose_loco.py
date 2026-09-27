@@ -243,7 +243,7 @@ def test_output_schema_has_the_required_columns(isolated, train_files):
 
 
 def test_never_touches_output_dir(isolated, train_files):
-    """A diagnostic-layer experiment must never touch output/ (CLAUDE.md rule)."""
+    """A diagnostic-layer experiment must never touch output/."""
     before = sorted(config.OUTPUT_DIR.iterdir()) if config.OUTPUT_DIR.exists() else None
     diagnose.run_loco_comparison(sample=1.0, use_embeddings=False)
     after = sorted(config.OUTPUT_DIR.iterdir()) if config.OUTPUT_DIR.exists() else None
@@ -253,7 +253,7 @@ def test_never_touches_output_dir(isolated, train_files):
 # --- 6. France / no-ground-truth handling -------------------------------------------------
 
 def test_france_is_never_a_direction_when_absent_from_training_sample(isolated, train_files):
-    """With a US/India-only training sample (the real CLAUDE.md scenario), France
+    """With a US/India-only training sample (the real training scenario), France
     must never appear as a LOCO direction, and no France row is fabricated."""
     out = diagnose.run_loco_comparison(sample=1.0, use_embeddings=False)
     assert "France" not in set(out["held_out_country"])

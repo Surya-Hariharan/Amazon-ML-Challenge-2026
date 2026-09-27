@@ -120,7 +120,7 @@ def test_downstream_run_does_not_mutate_production_config(isolated, train_files)
 # --- 3. output schema --------------------------------------------------------------------
 
 def test_downstream_run_output_schema_and_one_row_per_config(isolated, train_files):
-    """One row per configuration, in order, with every metric CLAUDE.md/the task
+    """One row per configuration, in order, with every metric the task
     requires, and a TSV + JSON sidecar written under artifacts/diagnostics/."""
     out = diagnose.run_blocking_k_downstream(sample=1.0, use_embeddings=False)
     configs = diagnose.blocking_k_downstream_configs()
@@ -154,7 +154,7 @@ def test_downstream_run_output_schema_and_one_row_per_config(isolated, train_fil
 
 
 def test_downstream_run_never_writes_output_dir(isolated, train_files):
-    """A diagnostic-layer experiment must never touch output/ (CLAUDE.md 5 rule)."""
+    """A diagnostic-layer experiment must never touch output/."""
     before = sorted(config.OUTPUT_DIR.iterdir()) if config.OUTPUT_DIR.exists() else None
     diagnose.run_blocking_k_downstream(sample=1.0, use_embeddings=False)
     after = sorted(config.OUTPUT_DIR.iterdir()) if config.OUTPUT_DIR.exists() else None

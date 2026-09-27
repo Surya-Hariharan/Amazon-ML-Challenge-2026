@@ -1,20 +1,19 @@
 """CLI entry point: data -> normalise -> blocking -> features -> model -> decide -> output.
 
-Usage (from code/business_entity_resolution/)::
+Usage (from code/)::
 
     python -m src.run_pipeline --mode valid [--stage blocking|features|model|all]
                                [--sample 0.1] [--no-embeddings] [--loco]
     python -m src.run_pipeline --mode test [--sample 0.5] [--no-embeddings]
 
 Paths come from ``config.py`` (``BER_DATA_DIR`` -> ``dataset/`` ->
-``student_resource/dataset/``). Every run appends a row to ``experiments.csv``
-(CLAUDE.md §5).
+``student_resource/dataset/``). Every run appends a row to ``experiments.csv``.
 
 * ``valid``: block + featurise the (optionally sub-sampled) training data. Split S1s
   80/20 (stratified on singleton vs not). Tune tau on GroupKFold OOF predictions of
   the 80% part, train on it, and score the held-out 20% with macro F0.5. Also dumps
   the 50 worst false positives/negatives to ``artifacts/errors_*.tsv``. ``--loco``
-  adds leave-one-country-out scores (CLAUDE.md §6.6), our only proxy for France.
+  adds leave-one-country-out scores, our only proxy for France.
 * ``test``: train on the training data (tau from OOF), then block, featurise and
   predict the test split. Writes both output files via ``io_utils.write_submission``.
   ``candidate_pairs.tsv`` is exactly the pair set the model scored.
@@ -136,7 +135,7 @@ def code_version(*modules: str) -> str:
 
 
 def _cached(name: str, key: str, fn: Callable[[], pd.DataFrame], use_cache: bool) -> pd.DataFrame:
-    """Load ``artifacts/<name>_<key>.parquet`` or compute and store it (CLAUDE.md §7)."""
+    """Load ``artifacts/<name>_<key>.parquet`` or compute and store it."""
     path = config.ARTIFACTS_DIR / f"{name}_{key}.parquet"
     if use_cache and path.exists():
         _log(f"cache hit {path.name}")
@@ -278,7 +277,7 @@ def fit_and_tune(feats: pd.DataFrame, truth: dict[str, list[str]], s1_ids: list[
 
 def dump_errors(scored: pd.DataFrame, pred: dict[str, list[str]], prep: dict,
                 n: int = 50, out_dir: Path | None = None) -> None:
-    """Write the ``n`` worst false positives and false negatives (CLAUDE.md §7).
+    """Write the ``n`` worst false positives and false negatives for error analysis.
 
     FPs: predicted pairs with label 0, highest probability first. FNs: true pairs
     among the candidates that were not predicted, lowest probability first.
@@ -455,7 +454,7 @@ def test_run(train: tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict],
 
     A thin wrapper over :func:`_train_model` and :func:`_predict_test`, kept so the
     whole pipeline stays testable end-to-end on synthetic DataFrames in one call
-    (CLAUDE.md's testability requirement). At full dataset scale, ``run_test``
+    (so the pipeline is unit-testable). At full dataset scale, ``run_test``
     calls the two halves directly as separate calls instead of going through this
     function, because a single call to this function requires the caller to pass
     ``train`` and ``test`` together, and Python keeps a reference to both on the

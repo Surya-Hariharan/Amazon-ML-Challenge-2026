@@ -249,7 +249,7 @@ def test_output_schema_has_one_row_per_subexperiment_and_required_columns(isolat
 
 
 def test_never_touches_output_dir_or_runs_full_scale(isolated, train_files):
-    """A diagnostic-layer experiment must never touch output/ (CLAUDE.md rule) and
+    """A diagnostic-layer experiment must never touch output/ and
     never invokes run_pipeline's --mode test path."""
     before = sorted(config.OUTPUT_DIR.iterdir()) if config.OUTPUT_DIR.exists() else None
     diagnose.run_decision_validation(sample=1.0, use_embeddings=False)

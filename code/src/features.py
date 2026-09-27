@@ -1,6 +1,6 @@
-"""Pairwise features for (S1, candidate) pairs (CLAUDE.md §6.3).
+"""Pairwise features for (S1, candidate) pairs.
 
-Design inputs (CP1 audit):
+Design inputs (training-data audit):
 
 * 38% of S1 records share their name with another S1 (one name is used 253 times),
   so name similarity alone cannot separate them. The address block below is as rich
@@ -14,7 +14,7 @@ Design inputs (CP1 audit):
   reverse rank among S1s competing for the same candidate, gap to best) are the main
   weapon against them.
 
-No country one-hots and no raw ID features (CLAUDE.md §2.4); ``same_country`` is the
+No country one-hots and no raw ID features (country is an open set); ``same_country`` is the
 only country-derived feature. Computation is chunked (``config.FEATURE_CHUNK`` pairs)
 and each chunk is written directly into a preallocated output buffer sized for the
 full pair count, so memory stays bounded by the final matrix size (~1x) rather than
@@ -264,7 +264,7 @@ def context_features(df: pd.DataFrame) -> pd.DataFrame:
     * ``rank_in_s1`` / ``gap_to_best_s1`` / ``n_cands_s1``: this candidate vs. the S1's
       other candidates.
     * ``rank_in_cand`` / ``gap_to_best_cand`` / ``n_s1_for_cand``: reverse view. Because
-      each S2/S3 record belongs to at most one S1 (CP1 audit), a candidate that is
+      each S2/S3 record belongs to at most one S1 (training-data audit), a candidate that is
       clearly better matched to another S1 is probably not this S1's match.
     * ``is_s3``: candidate source.
     """

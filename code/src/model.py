@@ -1,4 +1,4 @@
-"""LightGBM pair classifier: training, OOF predictions, save/load (CLAUDE.md §6.4).
+"""LightGBM pair classifier: training, OOF predictions, save/load.
 
 LightGBM is MIT-licensed and trained from scratch on the provided data (see MODELS.md).
 Cross-validation uses GroupKFold grouped by S1 ID, so an S1 never appears in both a

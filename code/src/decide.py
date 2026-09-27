@@ -1,8 +1,8 @@
-"""Thresholding and one-to-one assignment -> final match lists (CLAUDE.md §6.5).
+"""Thresholding and one-to-one assignment -> final match lists.
 
-* **One-to-one** (confirmed in the CP1 audit: no S2/S3 record matches more than one S1
-  in train). Each candidate is kept only under the S1 where its probability is
-  highest, before thresholding. This alone removes many false merges when chain names
+* **One-to-one** (confirmed by the training-data audit: no S2/S3 record matches more
+  than one S1 in train). Each candidate is kept only under the S1 where its
+  probability is highest, before thresholding. This alone removes many false merges when chain names
   put one record on several S1 candidate lists.
 * **Threshold tau** is tuned to maximise *macro F0.5 including singletons*, not
   pair-level F1. The sweep scores every S1 in scope: S1s with no candidates, true

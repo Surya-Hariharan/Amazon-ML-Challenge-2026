@@ -118,7 +118,7 @@ def test_blocking_ablation_run_does_not_mutate_config(isolated, train_files):
 # --- 5. (explicit K passed in -- covered above) / 6. output schema -------------------------
 
 def test_blocking_ablation_run_output_schema_and_one_row_per_config(isolated, train_files):
-    """One row per configuration, with every metric CLAUDE.md/P1 requires, and a TSV
+    """One row per configuration, with every required metric, and a TSV
     + JSON sidecar written under artifacts/diagnostics/."""
     out = diagnose.run_blocking_ablation(sample=1.0, use_embeddings=False)
     configs = diagnose.blocking_ablation_configs()
@@ -147,7 +147,7 @@ def test_blocking_ablation_run_output_schema_and_one_row_per_config(isolated, tr
 
 
 def test_blocking_ablation_run_never_writes_output_dir(isolated, train_files):
-    """A blocking-only diagnostic must never touch output/ (CLAUDE.md 5 rule) --
+    """A blocking-only diagnostic must never touch output/ --
     whatever output/ already held (e.g. README.md, .gitkeep) is unchanged."""
     before = sorted(config.OUTPUT_DIR.iterdir()) if config.OUTPUT_DIR.exists() else None
     diagnose.run_blocking_ablation(sample=1.0, use_embeddings=False)

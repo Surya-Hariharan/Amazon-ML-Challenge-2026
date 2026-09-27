@@ -1,18 +1,9 @@
 # Amazon ML Challenge 2026 — Guidelines and Key Instructions
 
-```
-Source:  6ab56657b4f1a_guidelines_and_key_instructions_amazon_ml_challenge_2026.pdf
-Status:  Authoritative challenge documentation
-Purpose: The official operational rulebook — challenge window, required artefacts,
-         submission limits, leaderboard mechanics, top-100 team requirements,
-         accessibility/login restrictions, and support process. Do not contradict this
-         document with project assumptions; update project docs/plan to match it.
-```
-
-This file is a faithful, unabridged transcription of the official PDF. See also
-[`problem_statement.md`](problem_statement.md) for the technical task definition,
-dataset schema, output format, and evaluation formula (from the companion "Amazon ML
-Challenge Problem Statement" document).
+> **Source:** official organizer PDF
+> (`guidelines_and_key_instructions_amazon_ml_challenge_2026.pdf`). This is a faithful,
+> unabridged transcription. For the technical task definition, dataset schema, output
+> format and evaluation formula see [problem-statement.md](problem-statement.md).
 
 We appreciate your participation in the **Amazon ML Challenge 2026**!!
 
@@ -61,15 +52,10 @@ round:
   - Model Architecture and feature engineering
   - Any other relevant information about the approach.
 
-> **Note on the "1-2-page document" vs. "no page limit" wording:** this Guidelines PDF
-> asks for a "1-2-page document" as a general best-solution artefact, while
-> `problem_statement.md`'s *Submission Requirements* §3 says the methodology document
-> (`Documentation_template.md`) has "no page limit — prioritise clarity and technical
-> depth over brevity." Both statements are transcribed here exactly as the organizers
-> wrote them; this project's working assumption (see `docs/planning/plan.md`'s "Open
-> conflicts" section) is to write the full detailed document but lead it with a 1-2 page
-> executive summary, satisfying either reading, pending organizer clarification via the
-> Google Form.
+> **Editor's note:** this PDF asks for a "1-2-page document", while the problem
+> statement (*Submission Requirements* §3) says the methodology document has "no page
+> limit". Our [methodology](methodology.md) satisfies both readings: it opens with a
+> short executive summary followed by the full technical detail.
 
 ## Simultaneous Logins and Accessibility
 
@@ -98,4 +84,4 @@ Regards,
 ---
 
 For the technical task definition, dataset schema, output format, and evaluation
-formula, see [`problem_statement.md`](problem_statement.md).
+formula, see [problem-statement.md](problem-statement.md).

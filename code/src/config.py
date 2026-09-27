@@ -83,9 +83,9 @@ N_FOLDS = 5
 #: run_pipeline.subsample_train). 1.0 = everything; lower it for fast iteration.
 TRAIN_SAMPLE_FRAC = 1.0
 
-# --- Blocking (tuned in CP3) -------------------------------------------------------
+# --- Blocking ----------------------------------------------------------------------
 
-#: CP1 audit: zero cross-country true pairs in train, so blocking within the same
+#: Data audit: zero cross-country true pairs in train, so blocking within the same
 #: country string is safe. Country stays an open set (France flows through).
 BLOCK_WITHIN_COUNTRY = True
 
@@ -168,14 +168,14 @@ TFIDF_ADDR_INDEX_TERMS = None
 #: S1 rows per chunk for the inverted-index passes (3-6).
 KEY_PASS_CHUNK = 50_000
 
-# --- Features (CP4) ----------------------------------------------------------------
+# --- Features ----------------------------------------------------------------------
 
 #: Pairs per feature chunk (bounds peak memory of string features).
 FEATURE_CHUNK = 250_000
 #: Records sampled to fit the feature TF-IDF vocabularies / IDF.
 FEATURE_TFIDF_FIT_SAMPLE = 2_000_000
 
-# --- Model (CP4) -------------------------------------------------------------------
+# --- Model -------------------------------------------------------------------------
 
 LGB_PARAMS = {
     "objective": "binary",
@@ -194,14 +194,14 @@ LGB_PARAMS = {
 LGB_NUM_BOOST_ROUND = 2000
 LGB_EARLY_STOPPING = 100
 
-# --- Decision (tuned in CP4) -------------------------------------------------------
+# --- Decision ----------------------------------------------------------------------
 
-#: Default threshold until tuned on OOF. CLAUDE.md §6.5 expects tau > 0.5 because
-#: ~25% of S2/S3 records are orphans (the main false-positive source).
+#: Default threshold until tuned on OOF. Set above 0.5 because ~25% of S2/S3
+#: records are orphans (the main false-positive source).
 MATCH_THRESHOLD = 0.6
 #: Optional "S1 is a singleton" threshold on the S1's top probability (None = off).
 SINGLETON_THRESHOLD = None
-#: CP1 audit: no S2/S3 record matches more than one S1 in train -> enforce one-to-one.
+#: Data audit: no S2/S3 record matches more than one S1 in train -> enforce one-to-one.
 ONE_TO_ONE = True
 #: Threshold sweep grid used by decide.tune_threshold.
 TAU_GRID = tuple(round(0.30 + 0.025 * i, 3) for i in range(27))  # 0.30 .. 0.95
